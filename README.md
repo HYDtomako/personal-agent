@@ -17,6 +17,25 @@
 pi coding agent（cwd = workspace/）
 ```
 
+## 概览
+
+独立构建的本地个人 Agent 系统：以 pi 为推理内核，自研运行时与交互层，整合长期记忆、多渠道通信、浏览器与桌面自动化及外部编码能力，目标是具备持续交互、记忆复用与本机执行能力的个人 agent。
+
+**技术栈**
+
+- 推理内核：[pi](https://github.com/earendil-works/pi)（coding agent）
+- 外部编码调度：herdr
+- 长期记忆：Notion（Memory 数据库）
+- 外部能力接入：MCP
+- 桌面自动化：CUA driver
+- 浏览器自动化：ego lite
+
+**长期记忆**：集成 Notion 构建外部长期记忆系统，分离会话上下文、长期记忆与对话流水，通过相关性检索与动态注入实现跨会话信息复用。
+
+**编码任务交付**：基于 herdr 调度外部 Coding Agent，结合独立执行、任务验收、Review 与结果回写，实现编码任务的后台执行及交付闭环。
+
+**跨渠道与自动化操作**：以 Telegram 为主要交互入口，可通过 QQ Bot 桥接实现跨渠道消息互通；集成 ego lite 浏览器自动化与 CUA 桌面操作，并接入邮箱能力，结合浏览器工具实现邮件收发、账号注册等事务性操作，拓展 agent 的实际执行能力。
+
 ## 快速开始
 
 需要 Node 24+。先装好 [pi](https://github.com/earendil-works/pi)，把 `config.example.json` 里的 `pi.args` 指到它的 `dist/bundle/cli.js`。
@@ -233,7 +252,3 @@ node scripts/docparse-selftest.ts [-v] 文件1 文件2 ...
 - **回复很慢或超时**：`pi.thinking` 越低越快（默认 `minimal`）；重活会跑满整个流程，正常。
 - **模型报错**：先在命令行手动跑一次 pi 确认 key 与模型名可用；`model_manage` 工具或界面右上角都能看到当前模型。
 - **PDF 读不出来**：需要 `pdftotext`（Git for Windows 自带），找不到时在 `files.pdftotext` 里填完整路径。
-
-## 许可
-
-MIT，见 [LICENSE](LICENSE)。
