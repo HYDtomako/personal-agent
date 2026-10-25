@@ -1,0 +1,28 @@
+node_modules/
+
+# 配置与运行状态（含密钥，绝不入库）
+config.json
+.model-state.json
+
+# 记忆与会话（含私人内容）
+memory/
+
+# agent 的工作目录：只放行人格模板、MCP 示例和扩展
+/workspace/*
+!/workspace/.pi
+/workspace/.pi/*
+!/workspace/.pi/extensions
+!/workspace/.pi/SYSTEM.example.md
+!/workspace/.pi/mcp.example.json
+
+# 运行数据与本地环境
+data/
+video-runtime/
+browser-runtime/
+.commandcode/
+__pycache__/
+*.pyc
+
+# 日志
+*.log
+log-*.txt

@@ -1,0 +1,31 @@
+{
+  "name": "pi-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Personal agent: QQ private chat (NapCat / OneBot 11) -> pi coding agent",
+  "scripts": {
+    "start": "node src/main.ts",
+    "app": "node app/launch.ts",
+    "app:install": "node app/install.ts",
+    "app:uninstall": "node app/install.ts --remove",
+    "app:stop": "node app/stop.ts",
+    "app:restart": "node app/launch.ts --restart",
+    "selftest:app": "node scripts/app-selftest.mjs",
+    "selftest:delegate": "node scripts/delegate-selftest.mjs",
+    "selftest:delegations": "node scripts/delegations-selftest.mjs",
+    "selftest:requests": "node scripts/requests-selftest.mjs",
+    "selftest:telegram": "node --test scripts/telegram-selftest.mjs",
+    "selftest:background": "node scripts/background-selftest.mjs",
+    "selftest:runner-background": "node scripts/runner-background-selftest.mjs",
+    "selftest:project-delivery": "node scripts/project-delivery-selftest.mjs",
+    "selftest:delivery-pipeline": "node scripts/delivery-pipeline-selftest.mjs",
+    "selftest:review-result": "node scripts/review-result-selftest.mjs",
+    "selftest:delivery-live": "node scripts/delivery-live-selftest.mjs",
+    "selftest:project-delivery-live": "node scripts/project-delivery-livecheck.mjs",
+    "smoke": "node scripts/smoke.ts",
+    "selftest:docparse": "node scripts/docparse-selftest.ts",
+    "selftest:video": "node scripts/video-selftest.ts",
+    "video:subtitle": "node scripts/video-subtitle.ts"
+  }
+}

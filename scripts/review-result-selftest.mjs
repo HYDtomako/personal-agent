@@ -1,0 +1,15 @@
+import assert from "node:assert/strict";
+import { parseReviewResult } from "../src/review-result.ts";
+const tools = [{ name: "bash", isError: false }];
+const valid = { verdict: "passed", summary: "verified", checks: ["node verify.mjs exited 0"], requiredTestsPassed: true, failures: [] };
+assert.equal(parseReviewResult(JSON.stringify(valid), tools).verdict, "passed");
+assert.equal(parseReviewResult("I will inspect files.\n\n" + JSON.stringify(valid), tools).verdict, "passed");
+assert.equal(parseReviewResult("note\n```json\n" + JSON.stringify(valid) + "\n```", tools).verdict, "passed");
+assert.equal(parseReviewResult(JSON.stringify({ ...valid, requiredTestsPassed: false, failures: ["baseline test failed"] }), tools).verdict, "unverified");
+assert.equal(parseReviewResult(JSON.stringify({ ...valid, requiredTestsPassed: undefined }), tools).verdict, "unverified");
+assert.equal(parseReviewResult(JSON.stringify(valid), []).verdict, "unverified");
+assert.equal(parseReviewResult(JSON.stringify(valid), [{ name: "bash", isError: true }]).verdict, "unverified");
+assert.equal(parseReviewResult("sample " + JSON.stringify(valid) + " actual tests failed", tools).verdict, "unverified");
+assert.equal(parseReviewResult(JSON.stringify({ ...valid, summary: "braces { in quoted } strings", checks: ["{ nested text }"] }), tools).verdict, "passed");
+assert.equal(parseReviewResult(JSON.stringify({ ...valid, verdict: "failed", requiredTestsPassed: false }), tools).verdict, "failed");
+console.log("PASS 10 reviewer result cases: final JSON, required tests and actual tool evidence");

@@ -1,0 +1,67 @@
+{
+  "agent": {
+    "userId": "me",
+    "workspace": "workspace",
+    "maxConcurrent": 2,
+    "timeoutMs": 180000
+  },
+  "delegations": {
+    "mode": "direct",
+    "timeoutMs": 3600000,
+    "maxTimeoutMs": 14400000,
+    "idleWarningMs": 900000,
+    "pollIntervalMs": 5000,
+    "startupTimeoutMs": 120000,
+    "maxConcurrent": 2,
+    "reviewTimeoutMs": 180000
+  },
+  "gui": {
+    "host": "127.0.0.1",
+    "port": 8787,
+    "token": "留空=不校验（仅本机访问时）；要改成 0.0.0.0 让手机也能连，这里必须填一个口令"
+  },
+  "pi": {
+    "command": "node",
+    "args": [
+      "/绝对路径/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
+      "--approve"
+    ],
+    "thinking": "minimal",
+    "tavilyKey": "你的-Tavily-API-key（https://tavily.com 免费额度）",
+    "defaultModel": "deepseek-flash",
+    "models": {
+      "deepseek-flash": "deepseek-flash",
+      "glm": "aliyun-maas/glm-5.3"
+    },
+    "aliyunKey": "你的阿里云百炼-API-key",
+    "aliyunBaseUrl": "你的百炼实例地址（形如 https://<实例id>.cn-beijing.maas.aliyuncs.com/compatible-mode/v1）"
+  },
+  "memory": {
+    "windowMs": 300000,
+    "summarizeMinBytes": 1024
+  },
+  "notion": {
+    "dataSourceId": "Notion Memory 数据库的 data source id（2025-09-03 API）",
+    "databaseId": "Notion Memory 数据库 id（新建记忆页面用）",
+    "timeoutMs": 8000
+  },
+  "files": {
+    "maxTextChars": 30000,
+    "maxTotalChars": 60000,
+    "pdftotext": "留空自动查找（PATH、Git for Windows 的 mingw64/bin）；找不到时 PDF 读不了，可填完整路径"
+  },
+  "web": {
+    "maxTextChars": 50000
+  },
+  "video": {
+    "enabled": true,
+    "ytDlp": "yt-dlp",
+    "proxy": "",
+    "maxDurationSec": 7200,
+    "maxTranscriptChars": 30000,
+    "timeoutMs": 600000,
+    "summaryTimeoutMs": 600000,
+    "keepArtifacts": false
+  },
+  "tasks": []
+}

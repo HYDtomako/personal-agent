@@ -1,0 +1,42 @@
+{
+  "mcpServers": {
+    "browser-use": {
+      "command": "<仓库路径>/browser-runtime/Scripts/python.exe",
+      "args": [
+        "-m",
+        "browser_use.mcp.server"
+      ],
+      "env": {
+        "OPENAI_API_KEY": "${DEEPSEEK_API_KEY}",
+        "BROWSER_USE_LLM_MODEL": "deepseek-flash",
+        "BROWSER_USE_CONFIG_PATH": "<仓库路径>/data/browser-use/config.json",
+        "BROWSER_USE_PROXY_URL": "socks5://127.0.0.1:10808",
+        "BROWSER_USE_LOGGING_LEVEL": "warning"
+      },
+      "exposure": "deferred",
+      "description": "浏览器自动化：打开网页、读取内容、点击、填写、截图。给目标自动完成网页操作。",
+      "timeout": 300
+    },
+    "notion": {
+      "command": "node",
+      "args": [
+        "<仓库路径>/data/notion-mcp/node_modules/@notionhq/notion-mcp-server/bin/cli.mjs"
+      ],
+      "env": {
+        "NOTION_TOKEN": "${NOTION_TOKEN}"
+      },
+      "exposure": "deferred",
+      "description": "Notion 知识库：搜索、读取、创建、更新页面和数据库。读写范围限于在 Notion 里手动授权给 pa 集成的页面。",
+      "timeout": 120
+    },
+    "cua-driver": {
+      "command": "<cua-driver 安装路径>/bin/cua-driver.exe",
+      "args": [
+        "mcp"
+      ],
+      "exposure": "deferred",
+      "description": "Cua Driver：直接操作 Windows 原生桌面应用（开程序、读窗口/可访问性树、点击输入），也带一套浏览器 CDP 工具。后台运行，不抢焦点。",
+      "timeout": 300
+    }
+  }
+}
