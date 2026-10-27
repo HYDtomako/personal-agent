@@ -62,14 +62,18 @@ export interface AgentConfig {
     maxInjectChars?: number;
     /** 注入的相关度门槛：问题词组被记忆条目覆盖的比例（0-1，默认 0.2） */
     minRelevanceScore?: number;
+    /** Notion 记忆内存缓存有效期（秒，默认 300=5 分钟；TTL 内不发请求） */
+    cacheTtlSeconds?: number;
   };
   notion?: {
     /** Notion Memory 数据库的 data source id（2025-09-03 API 查询用） */
     dataSourceId?: string;
     /** Notion Memory 数据库 id（扩展新建页面用） */
     databaseId?: string;
-    /** 单次 Notion API 超时（毫秒，默认 8000） */
+    /** 单次 Notion API 尝试的超时（毫秒，默认 3500；重试共 3 次） */
     timeoutMs?: number;
+    /** 建连/TLS 握手超时（毫秒，默认 3000） */
+    connectTimeoutMs?: number;
   };
   files?: {
     maxTextChars?: number;
@@ -108,6 +112,8 @@ export function loadConfig(path: string): AgentConfig {
   positive("agent.timeoutMs", cfg.agent.timeoutMs);
   positive("agent.maxConcurrent", cfg.agent.maxConcurrent);
   positive("notion.timeoutMs", cfg.notion?.timeoutMs);
+  positive("notion.connectTimeoutMs", cfg.notion?.connectTimeoutMs);
+  positive("memory.cacheTtlSeconds", cfg.memory?.cacheTtlSeconds);
   for (const field of ["timeoutMs", "maxTimeoutMs", "idleWarningMs", "pollIntervalMs", "startupTimeoutMs", "maxConcurrent", "reviewTimeoutMs"] as const) {
     positive(`delegations.${field}`, cfg.delegations?.[field]);
   }

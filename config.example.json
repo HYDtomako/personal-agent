@@ -38,12 +38,14 @@
   },
   "memory": {
     "windowMs": 300000,
-    "summarizeMinBytes": 1024
+    "summarizeMinBytes": 1024,
+    "cacheTtlSeconds": 300
   },
   "notion": {
     "dataSourceId": "Notion Memory 数据库的 data source id（2025-09-03 API）",
     "databaseId": "Notion Memory 数据库 id（新建记忆页面用）",
-    "timeoutMs": 8000
+    "timeoutMs": 3500,
+    "connectTimeoutMs": 3000
   },
   "files": {
     "maxTextChars": 30000,

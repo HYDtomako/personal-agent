@@ -15,6 +15,7 @@
     "selftest:delegate": "node scripts/delegate-selftest.mjs",
     "selftest:delegations": "node scripts/delegations-selftest.mjs",
     "selftest:requests": "node scripts/requests-selftest.mjs",
+    "selftest:notion-cache": "node scripts/notion-memory-cache-selftest.mjs",
     "selftest:telegram": "node --test scripts/telegram-selftest.mjs",
     "selftest:background": "node scripts/background-selftest.mjs",
     "selftest:runner-background": "node scripts/runner-background-selftest.mjs",

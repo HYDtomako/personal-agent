@@ -5,7 +5,7 @@ import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readd
 import { loadConfig } from "./config.ts";
 import { PiRunner, type PiEvent } from "./runner.ts";
 import { MemoryStore } from "./memory.ts";
-import { NotionMemory } from "./notion-memory.ts";
+import { NotionMemory, NotionMemoryCache } from "./notion-memory.ts";
 import { ChatStore, type ChatMessage, type ChatMeta } from "./store.ts";
 import { ingestUploads } from "./uploads.ts";
 import { GuiServer } from "./server.ts";
@@ -285,9 +285,27 @@ const memory = new MemoryStore({
 
 const notionMemory =
   notionKey && config.notion?.dataSourceId
-    ? new NotionMemory({ token: notionKey, dataSourceId: config.notion.dataSourceId, timeoutMs: config.notion.timeoutMs })
+    ? new NotionMemory({
+        token: notionKey,
+        dataSourceId: config.notion.dataSourceId,
+        timeoutMs: config.notion.timeoutMs,
+        connectTimeoutMs: config.notion?.connectTimeoutMs,
+        log: (message) => log(message),
+      })
     : undefined;
 if (!notionMemory) log("[memory] Notion Memory 未配置，长期记忆只能读本地归档");
+
+// 读取缓存：内存 TTL → data/notion-memory-cache.json 快照 → 本地冻结归档。
+// dirty 标记由 memory-tools 扩展（pi 子进程）写入，主进程每轮开头检查。
+const notionCache = notionMemory
+  ? new NotionMemoryCache({
+      memory: notionMemory,
+      snapshotFile: path.join(root, "data", "notion-memory-cache.json"),
+      dirtyFile: path.join(root, "data", "notion-memory-cache.dirty"),
+      ttlMs: (config.memory?.cacheTtlSeconds ?? 300) * 1000,
+      log: (message) => log(message),
+    })
+  : undefined;
 
 const store = new ChatStore(path.join(root, "memory", "chat.jsonl"));
 if (store.compact()) log("[store] 对话记录已压缩");
@@ -504,15 +522,16 @@ async function handleRequest(request: ConversationRequest): Promise<Conversation
     let memoryTotal = 0;
     let memorySource = "Notion 权威";
     try {
-      if (notionMemory) {
-        const entries = await notionMemory.listActive();
-        const sel = notionMemory.select(entries, request.text, {
+      if (notionCache && notionMemory) {
+        const loaded = await notionCache.load();
+        const sel = notionMemory.select(loaded.entries, request.text, {
           maxInjectChars: config.memory?.maxInjectChars,
           minRelevanceScore: config.memory?.minRelevanceScore,
         });
         memoryLines = sel.lines;
         memoryTotal = sel.total;
-        log(`[memory] Notion 注入 ${memoryLines.length}/${memoryTotal} 条`);
+        memorySource = loaded.label;
+        log(`[memory] ${loaded.label} 注入 ${memoryLines.length}/${memoryTotal} 条${loaded.stale ? "（stale，本轮刷新失败）" : ""}`);
       } else {
         const sel = memory.select(userId, request.text);
         memoryLines = sel.lines.map((line) => `- [archive] ${line.replace(/^- /, "")}`);
@@ -520,11 +539,11 @@ async function handleRequest(request: ConversationRequest): Promise<Conversation
         memorySource = "本地归档（Notion 未配置）";
       }
     } catch (error) {
-      log("[memory] Notion 读取失败，降级到本地归档:", error instanceof Error ? error.message : error);
+      log("[memory] Notion 实时与快照均不可用，降级到本地冻结归档:", error instanceof Error ? error.message : error);
       const sel = memory.select(userId, request.text);
       memoryLines = sel.lines.map((line) => `- [archive] ${line.replace(/^- /, "")}`);
       memoryTotal = sel.total;
-      memorySource = "本地归档兜底（Notion 读取失败）";
+      memorySource = "本地归档兜底（Notion 不可用）";
     }
     const background: string[] = [];
     if (summary) background.push(`[此前对话摘要（更早内容已压缩，供参考）]\n${summary}`);
