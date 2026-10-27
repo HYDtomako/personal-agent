@@ -31,12 +31,15 @@ interface ToolResult {
 }
 
 import path from "node:path";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(MODULE_DIR, "../../..");
 const MEM_DIR = path.join(ROOT_DIR, "memory", "long-term");
+/** 主进程的 Notion 记忆缓存目录（见 src/notion-memory.ts 的 NotionMemoryCache） */
+const CACHE_DIR = path.join(ROOT_DIR, "data");
+const CACHE_DIRTY_FILE = path.join(CACHE_DIR, "notion-memory-cache.dirty");
 
 const TOKEN = (process.env.NOTION_TOKEN ?? "").trim();
 const DATA_SOURCE_ID = (process.env.NOTION_MEMORY_DS ?? "").trim();
@@ -82,6 +85,20 @@ function configured(): string | undefined {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 写入成功后给主进程留标记：下一轮无视 TTL 重新拉一次 Notion。
+ * 本扩展跑在 pi 子进程里、主服务是另一个进程，只能靠文件通信；
+ * 标记只是优化，写失败不影响记忆本身。
+ */
+function markCacheDirty(): void {
+  try {
+    mkdirSync(CACHE_DIR, { recursive: true });
+    writeFileSync(CACHE_DIRTY_FILE, new Date().toISOString(), "utf8");
+  } catch {
+    /* 标记失败忽略：最坏情况是缓存多留一个 TTL */
+  }
 }
 
 /** 字符二元组集合（中文友好，无需分词）。 */
@@ -564,6 +581,7 @@ export default function memoryToolsExtension(pi: ExtensionAPI) {
           target.pageId,
           bodyBlocks({ text: raw, id: target.id, t: now, ...(basis ? { basis } : {}) }, kind),
         );
+        markCacheDirty();
         return text(`已合并到原有条目（${kind}，id=${target.id}）：\n旧：${target.text}\n新：${raw}`);
       }
 
@@ -572,6 +590,7 @@ export default function memoryToolsExtension(pi: ExtensionAPI) {
         if (!target) return text(`没有找到要关联的条目：${linkTo}`);
         const basis = target.id || target.pageId;
         const id = await createEntry(raw, kind, basis, keywords || undefined);
+        markCacheDirty();
         return text(`已新建并关联（${kind}，id=${id}）→ [${target.kind}] ${basis}：${raw}`);
       }
 
@@ -604,6 +623,7 @@ export default function memoryToolsExtension(pi: ExtensionAPI) {
               best.e.pageId,
               bodyBlocks({ text: raw, id: best.e.id, t: now, ...(basis ? { basis } : {}) }, kind),
             );
+            markCacheDirty();
             return text(`已更新原有 Notion 记忆条目（${kind}，id=${best.e.id}）：\n旧：${best.e.text}\n新：${raw}`);
           }
           return text(crossTypeHint(best.e, best.s));
@@ -611,6 +631,7 @@ export default function memoryToolsExtension(pi: ExtensionAPI) {
       }
 
       const id = await createEntry(raw, kind, undefined, keywords || undefined);
+      markCacheDirty();
       return text(`已写入 Notion（${kind}，id=${id}）：${raw}`);
     },
   });
@@ -718,6 +739,7 @@ export default function memoryToolsExtension(pi: ExtensionAPI) {
           ],
         });
       }
+      markCacheDirty();
       return text(`已归档 ${hit.length} 条（页面保留，可恢复）：\n${hit.map((e) => `- [${e.kind}] ${e.text}`).join("\n")}`);
     },
   });
