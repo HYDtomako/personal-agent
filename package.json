@@ -21,6 +21,7 @@
     "selftest:project-delivery": "node scripts/project-delivery-selftest.mjs",
     "selftest:delivery-pipeline": "node scripts/delivery-pipeline-selftest.mjs",
     "selftest:review-result": "node scripts/review-result-selftest.mjs",
+    "selftest:report-summary": "node scripts/selftest-report-summary.mjs",
     "selftest:delivery-live": "node scripts/delivery-live-selftest.mjs",
     "selftest:project-delivery-live": "node scripts/project-delivery-livecheck.mjs",
     "smoke": "node scripts/smoke.ts",
