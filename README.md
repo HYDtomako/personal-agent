@@ -1,10 +1,12 @@
 # pi-agent
 
+本仓库是跑在你电脑上的个人 Agent（PA）运行时；「咕嘎一号」/ Grok Bot 是入口和迁移面（桌面窗口、Telegram），不是另一套要单独部署的服务。
+
 住在你电脑上的个人 agent：浏览器打开一个本地页面就能跟它说话，它能查资料、记事、定任务，也能在你的工作目录里真的动手改文件、跑命令。
 
-大脑是 [pi](https://github.com/earendil-works/pi)（coding agent），界面是本机 HTTP 服务 + 一个单页（无构建、无前端依赖）。除 pi 本身外没有第三方依赖，Node 24 直接跑 TypeScript。
+大脑是 [pi](https://github.com/earendil-works/pi)（coding agent），界面是本机 HTTP 服务 + 一个单页（无构建、无前端依赖）。npm 零依赖（`package.json` 不装第三方包），需要本机已安装的 pi，以及按功能另装的可选运行时（herdr、yt-dlp、Telegram 代理、Notion、浏览器/桌面工具）。Node 24 直接跑 TypeScript。
 
-> 这是作者自用项目的公开版（内部昵称「咕嘎一号」）。QQ bot、Telegram、Notion 长期记忆都是可选集成，不配也能用。
+> MIT 许可，见 [LICENSE](LICENSE)。Telegram 是主要对话入口，只用本机页面也可以；QQ bot 与 Notion 长期记忆是可选集成，不配也能用。
 
 ```
 桌面窗口 / 浏览器 (127.0.0.1:8787)
@@ -21,14 +23,16 @@ pi coding agent（cwd = workspace/）
 
 独立构建的本地个人 Agent 系统：以 pi 为推理内核，自研运行时与交互层，整合长期记忆、多渠道通信、浏览器与桌面自动化及外部编码能力，目标是具备持续交互、记忆复用与本机执行能力的个人 agent。
 
-**技术栈**
+**技术栈**（npm 零依赖；除 Node 与 pi 外都是可选运行时，不随 `npm i` 安装）
 
-- 推理内核：[pi](https://github.com/earendil-works/pi)（coding agent）
-- 外部编码调度：herdr
-- 长期记忆：Notion（Memory 数据库）
-- 外部能力接入：MCP
-- 桌面自动化：CUA driver
-- 浏览器自动化：ego lite
+- 推理内核：[pi](https://github.com/earendil-works/pi)（必需，自行安装）
+- 对话入口：本机 GUI；Telegram 桥（`config.telegram`，可选）
+- 外部编码调度：herdr（可选；CA 不绑定具体执行器）
+- 长期记忆：Notion Memory 数据库（可选）
+- 外部能力接入：MCP（可选，安装前提写在 `workspace/.pi/mcp.example.json`）
+- 桌面自动化：CUA driver（可选）
+- 浏览器自动化：ego lite（可选）
+- 视频字幕：yt-dlp（可选）
 
 **长期记忆**：集成 Notion 构建外部长期记忆系统，分离会话上下文、长期记忆与对话流水，通过相关性检索与动态注入实现跨会话信息复用。
 
@@ -38,17 +42,17 @@ pi coding agent（cwd = workspace/）
 
 ## 快速开始
 
-需要 Node 24+。先装好 [pi](https://github.com/earendil-works/pi)，把 `config.example.json` 里的 `pi.args` 指到它的 `dist/bundle/cli.js`。
+需要 Node 24+。npm 零依赖：`npm i` 不会装 pi 或任何第三方包。先装好 [pi](https://github.com/earendil-works/pi)，把 `config.example.json` 里的 `pi.args` 指到它的 `dist/bundle/cli.js`。后台编码、视频字幕、浏览器、Notion、桌面操作都是可选运行时，用到再装（见上面的技术栈，以及 `mcp.example.json` 里每项的前提）。
 
 ```bash
 npm i
-cp config.example.json config.json                            # 填 pi 路径、模型、Tavily key
+cp config.example.json config.json                            # 填 pi 路径和模型 key；要用 Telegram 再把 telegram.enabled 改成 true，并填写 token 与 allowFrom
 cp workspace/.pi/SYSTEM.example.md workspace/.pi/SYSTEM.md    # 人格与行为准则，按需改
-cp workspace/.pi/mcp.example.json workspace/.pi/mcp.json      # 可选：MCP 服务（浏览器、Notion、桌面操作）
+cp workspace/.pi/mcp.example.json workspace/.pi/mcp.json      # 可选：MCP（浏览器、Notion、桌面）。先看文件里的安装前提，没装的服务删掉
 npm run app:install                                          # 可选：装桌面图标
 ```
 
-`config.json` 含密钥，`.gitignore` 已排除。`workspace/.pi/SYSTEM.md` 建议按自己的习惯改写，同样不要提交个人内容。
+`config.json` 含密钥，`.gitignore` 已排除。`telegram` 段与 `tg-bridge.mjs`、`app/launch.ts` 对齐：`enabled`、`token`、`apiBase`、`proxy`、`allowFrom`、`pollTimeoutSec`。`enabled` 默认 `false`，复制后不会去连 Telegram。改成 `true` 时必须换成真实 bot token；`allowFrom` 留空时桥只回显你的 Telegram id，不把消息转进 PA。`apiBase` 默认 `https://api.telegram.org`，`proxy` 默认 `socks5h://127.0.0.1:10808`（空字符串会被配置校验拒绝）。`workspace/.pi/SYSTEM.md` 建议按自己的习惯改写，同样不要提交个人内容。CA 不绑定具体执行器，模板里也不写死某一台机器的绝对路径。
 
 双击桌面上的「咕嘎一号」即可：同时确保 PA 主服务和 Telegram 桥接都在运行，重复点击不会另起实例。项目目录里的 `start-pa.bat` 用于正常启动，`restart-pa.bat` 用于只重启本项目的这两个进程，不操作 QQbot；不另外创建桌面重启图标。也可以 `npm start` 只起主服务、自己开页面。`config.json` 里的 `agent.userId` 是记忆归档用的键，随便起个名字（默认 `me`）。
 
@@ -83,7 +87,7 @@ PA 的对话轮次与 CA 编码任务现在分开运行。`agent_dispatch` 只�
 
 | 设置 | 默认值 | 含义 |
 |---|---:|---|
-| `agent.timeoutMs` | 180000（3 分钟） | PA 单轮理解、派发和短处理，不包含 CA 执行 |
+| `agent.timeoutMs` | 180000（3 分钟 / 180 秒） | PA 单轮理解、派发和短处理，不包含 CA 执行 |
 | `delegations.timeoutMs` | 3600000（60 分钟） | CA 开始执行后的总体时限，排队时间不计入 |
 | `delegations.maxTimeoutMs` | 14400000（4 小时） | 单个任务可指定的时限上限 |
 | `delegations.idleWarningMs` | 900000（15 分钟） | 无可观察进展时提醒，不立即杀掉 CA |
@@ -150,13 +154,15 @@ node scripts/delivery-live-selftest.mjs --send
 - **使用者身份经环境变量注入**（`PI_USER_ID`）。旧做法是让模型从消息里抄一个"我是谁"，那是个能被注入骗过的字段；现在模型改不了自己是谁。
 - **页面只监听 127.0.0.1**。要让手机也能连，`gui.host` 改 `0.0.0.0` 时必须设 `gui.token`——不设会被启动检查直接拦下，因为那等于把有 shell 权限的 agent 开放给整个网段。
 - **图片/文件只从 workspace 里读**：`/api/file` 做了路径穿越检查（`../config.json` 一律 404）。
-- **输出统一脱敏**：配置里的密钥值、`sk-`/`tvly-`/`Bearer` 形态、百炼实例域名都不会出现在页面上。
+- **输出统一脱敏**：配置里的密钥值（含 `telegram.token`、带账号密码的 `telegram.proxy`）、`sk-`/`tvly-`/`Bearer` 形态、Telegram bot token 形态、百炼实例域名都不会出现在页面和日志里。
 
 ## 目录
 
 ```
+tg-bridge.mjs  Telegram 长轮询桥（读 config.telegram，独立进程；主入口之一）
 src/
   main.ts    启动、消息处理、定时任务、脱敏
+  redact.ts  密钥收集与脱敏（含 telegram token）
   server.ts  HTTP + SSE + 上传 + 文件服务（无依赖）
   runner.ts  pi 执行器：身份/请求上下文注入 + 事件流解析 + 中止
   requests.ts 持久聊天队列与幂等请求（只串行短轮次）
@@ -240,7 +246,7 @@ node scripts/docparse-selftest.ts [-v] 文件1 文件2 ...
 - **定时任务与普通对话用同一套工具**：交互消息优先执行，没排队的交互任务时才轮到定时任务。
 - **一张图片也别指望它自己贴上来**：让它把生成的图显示到页面上，需要它在回复里写一行 `[[IMG:workspace 下的相对路径]]`，页面会渲染成图片（只允许 workspace 内的路径）。
 - **两个"记忆"不是一回事**：`memory/user-<id>.jsonl` 是给模型看的会话上下文（pi 的事件流），`memory/chat.jsonl` 是给你看的对话记录。想从头开始，删掉这两个文件即可。长期记忆不在这里：它在 Notion 的 Memory 数据库，本地 `memory/long-term/` 只是只读归档。
-- **PA 单轮与 CA 时限分离**：`agent.timeoutMs` 默认 300 秒（5 分钟），只约束对话轮次；CA 默认独立执行 60 分钟。PA 超时或界面「停止」不取消已派发 CA；取消编码任务要用任务面板或 `agent_cancel`。
+- **PA 单轮与 CA 时限分离**：`agent.timeoutMs` 默认 180000（3 分钟 / 180 秒），只约束对话轮次；CA 默认独立执行 60 分钟。PA 超时或界面「停止」不取消已派发 CA；取消编码任务要用任务面板或 `agent_cancel`。
 - **`workspace/` 不是沙箱**。给的是你账户的完整权限，`cd ..` 就能出去。人格里写了"别碰 config.json / memory / src"，但那是纪律，不是墙。要长期挂着跑又不想盯着，正确做法是把它整个放进容器或 WSL 里，只挂需要的工作目录（pi 官方文档 `docs/security.md`、`docs/containerization.md` 也是这个建议）。
 
 ## 排障
@@ -252,3 +258,11 @@ node scripts/docparse-selftest.ts [-v] 文件1 文件2 ...
 - **回复很慢或超时**：`pi.thinking` 越低越快（默认 `minimal`）；重活会跑满整个流程，正常。
 - **模型报错**：先在命令行手动跑一次 pi 确认 key 与模型名可用；`model_manage` 工具或界面右上角都能看到当前模型。
 - **PDF 读不出来**：需要 `pdftotext`（Git for Windows 自带），找不到时在 `files.pdftotext` 里填完整路径。
+
+## 附录：QQ（可选，不是主入口）
+
+主入口是本机页面和 Telegram。QQ 需要另外部署 NapCat / OneBot bot，不在本仓库的 npm 依赖里，也不在 `mcp.json` 里。配了之后，主服务把回执写到 bot 的文件信箱；`delegations.qqBridgeDir` 可改信箱目录，默认是仓库旁的 `pi-napcatqq/memory/bridge`。不配 QQ 不影响 Telegram 和本地 GUI。
+
+## 许可
+
+本项目以 MIT 许可证开源。Copyright (c) 2026 HYDtomako。全文见 [LICENSE](LICENSE)。

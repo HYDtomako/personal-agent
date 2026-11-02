@@ -3,7 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Personal agent: QQ private chat (NapCat / OneBot 11) -> pi coding agent",
+  "description": "Local PA runtime: Telegram and a localhost GUI in front of the pi coding agent. QQ/NapCat is an optional appendix, not the main entry.",
+  "license": "MIT",
   "scripts": {
     "start": "node src/main.ts",
     "app": "node app/launch.ts",

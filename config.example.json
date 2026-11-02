@@ -20,6 +20,14 @@
     "port": 8787,
     "token": "留空=不校验（仅本机访问时）；要改成 0.0.0.0 让手机也能连，这里必须填一个口令"
   },
+  "telegram": {
+    "enabled": false,
+    "token": "BotFather 发的 bot token；把 enabled 改成 true 后必填",
+    "apiBase": "https://api.telegram.org",
+    "proxy": "socks5h://127.0.0.1:10808",
+    "allowFrom": [],
+    "pollTimeoutSec": 30
+  },
   "pi": {
     "command": "node",
     "args": [
