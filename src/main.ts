@@ -19,12 +19,14 @@ import { createHash } from "node:crypto";
 import { ProjectDelivery, type DeliveryRecord, type ReviewResult } from "./project-delivery.ts";
 import { DeliveryPipeline, deliveryText } from "./delivery-pipeline.ts";
 import { parseReviewResult } from "./review-result.ts";
+import { collectConfigSecrets, redactText } from "./redact.ts";
 
 /**
  * 个人 agent 主程序：本地 GUI ↔ pi。
  *
- * 没有通信层了——浏览器打开 127.0.0.1 就是这个 agent 的界面，
- * 消息直接落盘成对话记录，pi 的事件流经 SSE 实时推回页面。
+ * 浏览器打开 127.0.0.1 是本机界面。Telegram 是独立进程 tg-bridge.mjs，
+ * 读 config.telegram；QQ 只是可选的外部信箱。消息落盘成对话记录，
+ * pi 的事件流经 SSE 实时推回页面。
  *
  * 单套工具：本地读写/命令与联网、记忆等扩展工具全部可用，不再按模式分级。
  */
@@ -78,17 +80,10 @@ const deepseekKey = loadAuthKey("deepseek");
 const notionKey = loadAuthKey("notion");
 
 // ── 输出脱敏：密钥不得出现在页面上（防的是截图、录屏、随手分享）──
-const SECRETS: string[] = [config.pi.tavilyKey, config.pi.aliyunKey, config.pi.aliyunBaseUrl, config.gui?.token, deepseekKey, notionKey].filter(
-  (s): s is string => !!s,
-);
+const SECRETS = collectConfigSecrets(config, [deepseekKey, notionKey]);
 
 function redactSensitive(s: string): string {
-  let out = s;
-  for (const secret of SECRETS) out = out.split(secret).join("[密钥已隐藏]");
-  out = out.replace(/\b(?:sk|tvly)-[A-Za-z0-9_-]{8,}\b/g, "[密钥已隐藏]");
-  out = out.replace(/\bBearer\s+[A-Za-z0-9._-]{10,}/gi, "Bearer [已隐藏]");
-  out = out.replace(/[a-z0-9-]+\.(?:cn-beijing\.)?maas\.aliyuncs\.com/gi, "[接口地址已隐藏]");
-  return out;
+  return redactText(s, SECRETS);
 }
 
 const turnTimeoutMs = config.agent?.timeoutMs ?? 180_000;

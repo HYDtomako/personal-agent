@@ -1,4 +1,5 @@
 {
+  "_comment": "复制为 workspace/.pi/mcp.json 后再改路径。下面每一项都要单独安装，不在本仓库的 npm 依赖里：browser-use 需要本机 Python 环境与 browser-use 包；notion 需要已安装的 @notionhq/notion-mcp-server，令牌来自 NOTION_TOKEN；cua-driver 需要单独安装的桌面驱动可执行文件。没装的服务整段删掉。QQ/NapCat 不在这个文件里配置，也不是主入口；只有另外部署了 QQ bot 时才用环境变量 QQ_BOT_DIR，见 README 附录。",
   "mcpServers": {
     "browser-use": {
       "command": "<仓库路径>/browser-runtime/Scripts/python.exe",
@@ -14,7 +15,7 @@
         "BROWSER_USE_LOGGING_LEVEL": "warning"
       },
       "exposure": "deferred",
-      "description": "浏览器自动化：打开网页、读取内容、点击、填写、截图。给目标自动完成网页操作。",
+      "description": "可选。前提：本机 Python（示例用仓库旁的 browser-runtime 虚拟环境）已安装 browser-use，并准备好 data/browser-use/config.json。浏览器自动化：打开网页、读取内容、点击、填写、截图。",
       "timeout": 300
     },
     "notion": {
@@ -26,7 +27,7 @@
         "NOTION_TOKEN": "${NOTION_TOKEN}"
       },
       "exposure": "deferred",
-      "description": "Notion 知识库：搜索、读取、创建、更新页面和数据库。读写范围限于在 Notion 里手动授权给 pa 集成的页面。",
+      "description": "可选。前提：单独 npm 安装 @notionhq/notion-mcp-server，并设置 NOTION_TOKEN（只访问在 Notion 里授权给该集成的页面）。搜索、读取、创建、更新页面和数据库。",
       "timeout": 120
     },
     "cua-driver": {
@@ -35,7 +36,7 @@
         "mcp"
       ],
       "exposure": "deferred",
-      "description": "Cua Driver：直接操作 Windows 原生桌面应用（开程序、读窗口/可访问性树、点击输入），也带一套浏览器 CDP 工具。后台运行，不抢焦点。",
+      "description": "可选，仅 Windows。前提：单独安装 cua-driver，把 command 换成它的可执行文件。直接操作原生桌面应用（开程序、读窗口/可访问性树、点击输入），也带一套浏览器 CDP 工具。后台运行，不抢焦点。",
       "timeout": 300
     }
   }

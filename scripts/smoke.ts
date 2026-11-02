@@ -2,6 +2,7 @@ import path from "node:path";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { loadConfig } from "../src/config.ts";
+import { collectConfigSecrets, redactText } from "../src/redact.ts";
 import { MemoryStore } from "../src/memory.ts";
 import { ChatStore } from "../src/store.ts";
 import { ingestUploads } from "../src/uploads.ts";
@@ -53,6 +54,57 @@ try {
   guard = e instanceof Error ? e.message : String(e);
 }
 check("对外监听无口令被拦下", guard.includes("token"), guard.slice(0, 60));
+check(
+  "示例含完整 telegram 段且默认不启用",
+  example.telegram?.enabled === false
+    && example.telegram.apiBase === "https://api.telegram.org"
+    && example.telegram.proxy === "socks5h://127.0.0.1:10808"
+    && Array.isArray(example.telegram.allowFrom)
+    && example.telegram.allowFrom.length === 0
+    && example.telegram.pollTimeoutSec === 30
+    && !!example.telegram.token,
+);
+
+function expectConfigError(name: string, telegram: unknown, includes: string): void {
+  const file = path.join(tmp, `${name}.json`);
+  writeFileSync(file, JSON.stringify({ ...example, telegram }));
+  let message = "";
+  try {
+    loadConfig(file);
+  } catch (e) {
+    message = e instanceof Error ? e.message : String(e);
+  }
+  check(name, message.includes(includes), message.slice(0, 80));
+}
+expectConfigError("启用 Telegram 但 token 为空被拦下", { enabled: true, token: "  " }, "token 为空");
+expectConfigError("启用 Telegram 时拒绝示例占位 token", { enabled: true, token: "BotFather 发的 bot token" }, "示例占位");
+expectConfigError("pollTimeoutSec 超出 50 被拦下", { enabled: false, pollTimeoutSec: 51 }, "pollTimeoutSec");
+expectConfigError("allowFrom 不是数组被拦下", { enabled: false, allowFrom: "123" }, "allowFrom");
+expectConfigError("空代理被拦下", { enabled: false, proxy: "" }, "proxy");
+
+const tgToken = "123456789:AAHexampleTelegramBotTokenValue";
+const otherToken = "99999999:AAHanotherTelegramBotTokenValueXX";
+const secrets = collectConfigSecrets(
+  {
+    pi: { tavilyKey: "tvly-configuredkey" },
+    gui: { token: "gui-secret-token" },
+    telegram: { token: `  ${tgToken}  `, proxy: "socks5h://alice:s3cret-pass@127.0.0.1:10808" },
+  },
+  ["notion-secret-token"],
+);
+const leaked = [
+  `configured ${tgToken}`,
+  "proxy socks5h://alice:s3cret-pass@127.0.0.1:10808",
+  "gui-secret-token",
+  `url https://api.telegram.org/bot${otherToken}/getUpdates`,
+  "tvly-otherkeyvalue",
+].join(" ");
+const redacted = redactText(leaked, secrets);
+check("配置里的 telegram token 被整段隐藏", !redacted.includes(tgToken) && redacted.includes("[密钥已隐藏]"));
+check("带账号的 telegram 代理被隐藏", !redacted.includes("s3cret-pass") && !redacted.includes("alice:s3cret-pass"));
+check("未列入配置的 bot token URL 也被隐藏", !redacted.includes(otherToken) && !redacted.includes(`/bot${otherToken}`));
+check("无账号的代理地址不算密钥", collectConfigSecrets({ telegram: { proxy: "socks5h://127.0.0.1:10808" } }).length === 0);
+check("gui / 检索 key 仍被隐藏", !redacted.includes("gui-secret-token") && !redacted.includes("tvly-otherkeyvalue"));
 
 function userIdFromConfig(p: string, fallback: string): string {
   try {
