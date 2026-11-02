@@ -6,7 +6,7 @@
 
 大脑是 [pi](https://github.com/earendil-works/pi)（coding agent），界面是本机 HTTP 服务 + 一个单页（无构建、无前端依赖）。npm 零依赖（`package.json` 不装第三方包），需要本机已安装的 pi，以及按功能另装的可选运行时（herdr、yt-dlp、Telegram 代理、Notion、浏览器/桌面工具）。Node 24 直接跑 TypeScript。
 
-> 源码公开，方便阅读和自用部署，但没有开源许可证（见文末「许可」）。Telegram 是主要对话入口，只用本机页面也可以；QQ bot 与 Notion 长期记忆是可选集成，不配也能用。
+> MIT 许可，见 [LICENSE](LICENSE)。Telegram 是主要对话入口，只用本机页面也可以；QQ bot 与 Notion 长期记忆是可选集成，不配也能用。
 
 ```
 桌面窗口 / 浏览器 (127.0.0.1:8787)
@@ -265,4 +265,4 @@ node scripts/docparse-selftest.ts [-v] 文件1 文件2 ...
 
 ## 许可
 
-源码放在公开仓库里，便于阅读和自己部署。本仓库**没有**开源许可证：不授予使用、复制、修改、再发布或商用的许可。看见源码不等于可以把它当成开源项目使用。需要授权请联系作者。`package.json` 的 `"license": "UNLICENSED"` 表示同一件事。
+本项目以 MIT 许可证开源。Copyright (c) 2026 HYDtomako。全文见 [LICENSE](LICENSE)。
