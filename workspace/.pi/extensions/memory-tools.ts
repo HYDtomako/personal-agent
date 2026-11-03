@@ -255,16 +255,92 @@ function toEntry(page: { id: string; properties?: Record<string, unknown> }): En
 
 let lastCallAt = 0;
 
+/** 与 src/notion-memory.ts 一致：网络层异常最多 3 次，退避 300ms / 800ms。 */
+const NETWORK_ATTEMPTS = 3;
+const NETWORK_RETRY_DELAYS_MS = [300, 800];
+/** 原有 429 退避：900ms × 次数，最多 4 次尝试（前 3 次等待后重试）。 */
+const RATE_LIMIT_ATTEMPTS = 4;
+const RETRYABLE_NETWORK_CODES = new Set([
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ECONNABORTED",
+  "EPIPE",
+  "ETIMEDOUT",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+]);
+
+function errorCode(error: unknown): string {
+  if (!error || typeof error !== "object") return "";
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" ? code : "";
+}
+
+/** 错误描述带上 cause 的 code 与 message，避免只剩 TypeError: fetch failed。 */
+function describeCause(cause: unknown, depth = 0): string {
+  if (cause == null || depth > 3) return "";
+  if (cause instanceof Error) {
+    const code = errorCode(cause);
+    const nested = describeCause((cause as { cause?: unknown }).cause, depth + 1);
+    const self = `${code ? `${code}: ` : ""}${cause.message}`;
+    return nested ? `${self} (cause ${nested})` : self;
+  }
+  if (typeof cause === "object") {
+    const code = errorCode(cause);
+    const message = (cause as { message?: unknown }).message;
+    return [code, typeof message === "string" ? message : ""].filter(Boolean).join(": ");
+  }
+  return String(cause);
+}
+
+function describeError(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const code = errorCode(error);
+  const head = `${error.name}${code ? ` ${code}` : ""}: ${error.message}`;
+  const cause = describeCause((error as { cause?: unknown }).cause);
+  return cause ? `${head} (cause ${cause})` : head;
+}
+
+function matchesRetryableNetworkError(error: unknown): boolean {
+  if (!(error instanceof Error)) return RETRYABLE_NETWORK_CODES.has(errorCode(error));
+  if (RETRYABLE_NETWORK_CODES.has(errorCode(error))) return true;
+  if (error.name === "AbortError" || error.name === "TimeoutError" || error instanceof TypeError) return true;
+  return /fetch failed|socket hang up|connect timeout|network/i.test(error.message);
+}
+
+/** 对齐 notion-memory.ts：本错误或 cause 上的传输层失败才重试。 */
+function isRetryableNetworkError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  if (matchesRetryableNetworkError(error)) return true;
+  return matchesRetryableNetworkError((error as { cause?: unknown }).cause);
+}
+
+function failure(method: string, apiPath: string, error: unknown, kind: "网络错误" | "失败"): Error {
+  const normalized = error instanceof Error ? error : new Error(String(error));
+  return new Error(`${method} ${apiPath} ${kind}：${describeError(normalized)}`, { cause: normalized });
+}
+
+/**
+ * 单次 Notion API 调用。
+ *  - 网络层（fetch failed / ECONNRESET / AbortError / TimeoutError / TypeError / cause code）：3 次，300ms / 800ms
+ *  - 429：保持原退避（900ms × 次数，最多 4 次）
+ *  - 其它 HTTP 4xx/5xx：不重试
+ */
 async function call<T>(method: string, apiPath: string, body?: unknown): Promise<T> {
   const wait = 320 - (Date.now() - lastCallAt);
   if (wait > 0) await sleep(wait);
   lastCallAt = Date.now();
 
-  for (let attempt = 0; attempt < 4; attempt++) {
+  let networkAttempt = 0;
+  let lastError: Error | undefined;
+  for (let attempt = 0; attempt < RATE_LIMIT_ATTEMPTS; attempt++) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    let res: Awaited<ReturnType<typeof fetch>>;
     try {
-      const res = await fetch(NOTION_API + apiPath, {
+      res = await fetch(NOTION_API + apiPath, {
         method,
         headers: {
           Authorization: `Bearer ${TOKEN}`,
@@ -274,19 +350,28 @@ async function call<T>(method: string, apiPath: string, body?: unknown): Promise
         body: body ? JSON.stringify(body) : undefined,
         signal: controller.signal,
       });
-      if (res.status === 429 && attempt < 3) {
-        clearTimeout(timer);
-        await sleep(900 * (attempt + 1));
-        continue;
-      }
-      const json = (await res.json().catch(() => ({}))) as { message?: string };
-      if (!res.ok) throw new Error(`${method} ${apiPath} → ${res.status} ${json.message ?? ""}`);
-      return json as T;
+    } catch (error) {
+      clearTimeout(timer);
+      const normalized = error instanceof Error ? error : new Error(String(error));
+      lastError = normalized;
+      networkAttempt++;
+      if (!isRetryableNetworkError(normalized)) throw failure(method, apiPath, normalized, "失败");
+      if (networkAttempt >= NETWORK_ATTEMPTS) throw failure(method, apiPath, normalized, "网络错误");
+      await sleep(NETWORK_RETRY_DELAYS_MS[networkAttempt - 1] ?? 800);
+      continue;
     } finally {
       clearTimeout(timer);
     }
+
+    if (res.status === 429 && attempt < RATE_LIMIT_ATTEMPTS - 1) {
+      await sleep(900 * (attempt + 1));
+      continue;
+    }
+    const json = (await res.json().catch(() => ({}))) as { message?: string };
+    if (!res.ok) throw new Error(`${method} ${apiPath} → ${res.status} ${json.message ?? ""}`.trim());
+    return json as T;
   }
-  throw new Error(`${method} ${apiPath} 被限流`);
+  throw lastError ?? new Error(`${method} ${apiPath} 被限流`);
 }
 
 async function listActive(kind?: Kind): Promise<Entry[]> {
