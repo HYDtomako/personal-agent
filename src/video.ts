@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import path from "node:path";
 
@@ -73,6 +73,10 @@ const SUBTITLE_EXTS = new Set([".vtt", ".srt"]);
 const DEFAULT_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_MAX_DURATION_SEC = 2 * 60 * 60;
 const DEFAULT_MAX_TRANSCRIPT_CHARS = 30_000;
+// 这些站点匿名访问时通常不下发字幕轨，只有登录态才给（用于挑错误文案，不参与抓取）。
+const LOGIN_REQUIRED_HOSTS = new Set(["b23.tv", "bilibili.com", "bilibili.tv"]);
+// ego lite（命令 ego-browser）的常见落点，只用于判断本机装没装，进而决定提示怎么写。
+const EGO_CLI_NAMES = ["ego-browser", "ego-browser.cmd", "ego-browser.exe", "ego-browser.ps1"];
 
 export function isHttpUrl(raw: string): boolean {
   try {
@@ -126,9 +130,9 @@ export class VideoAnalyzer {
       const metadata = await this.readMetadata(url, jobDir);
       this.checkLimits(metadata);
       const subtitlePath = await this.downloadSubtitles(url, jobDir);
-      if (!subtitlePath) throw new Error("这个视频没有可读取的字幕；当前 pa 只支持有字幕的视频。");
+      if (!subtitlePath) throw new Error(missingSubtitleMessage(url));
       const transcript = parseSubtitle(readFileSync(subtitlePath, "utf8"));
-      if (!transcript.trim()) throw new Error("字幕文件为空；当前 pa 只支持有文字内容的字幕。");
+      if (!transcript.trim()) throw new Error(emptySubtitleMessage());
 
       const clipped = clipTranscript(transcript, this.opts.maxTranscriptChars ?? DEFAULT_MAX_TRANSCRIPT_CHARS);
       const transcriptPath = path.join(jobDir, "transcript.md");
@@ -355,4 +359,59 @@ function finiteNumber(value: unknown): number | undefined {
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+// 以下三个函数只负责拼面向用户的提示文案，不参与抓取、不改探测顺序。
+function missingSubtitleMessage(rawUrl: string): string {
+  const host = hostnameOf(rawUrl);
+  const needsLogin = [...LOGIN_REQUIRED_HOSTS].some((item) => host === item || host.endsWith(`.${item}`));
+  const reason = needsLogin
+    ? `${host} 匿名访问时一般不下发字幕轨，要有登录态才会返回字幕。`
+    : `没有从 ${host} 取到任何字幕轨：可能这个视频本身没字幕，也可能要登录才给。`;
+  return [
+    reason,
+    "卡住的位置：这次只做了一次匿名取字幕，没有带任何登录凭据，所以到这一步已经没有别的可试。",
+    egoFallbackHint(),
+    "补充：本机不会自动读 Chrome/Edge 的 cookie——浏览器运行时 Cookie 库被独占锁，Chromium 127+ 起还有应用绑定加密，外部程序解不开。要登录态就走 ego lite，或人工提供该站点的 Netscape 格式 cookies.txt。",
+  ].join("\n");
+}
+
+function emptySubtitleMessage(): string {
+  return [
+    "取到了字幕文件，但解析后没有可读文字（可能只有时间轴，或自动字幕是空的），这个视频的字幕不够用。",
+    egoFallbackHint(),
+  ].join("\n");
+}
+
+function egoFallbackHint(): string {
+  return hasEgoBrowser()
+    ? "下一步：本机有 ego lite。让它打开这个视频页（已登录的站点会直接复用登录态），从页面上取字幕或正文，比继续折腾 cookie 靠谱。"
+    : "下一步：本机没装 ego lite。装一个并登录该站点后可以让它打开页面取字幕；不装就只能人工提供该站点的 Netscape 格式 cookies.txt，否则这一步没法继续。";
+}
+
+// 只判断本机装没装 ego lite（命令 ego-browser），仅用于挑提示文案；出错一律当作没装。
+function hasEgoBrowser(): boolean {
+  try {
+    const dirs = (process.env.PATH ?? process.env.Path ?? "").split(path.delimiter).filter((dir) => dir.trim());
+    for (const dir of dirs) {
+      if (EGO_CLI_NAMES.some((name) => existsSync(path.join(dir, name)))) return true;
+    }
+    const home = process.env.USERPROFILE ?? process.env.HOME ?? "";
+    const candidates = [
+      path.join(process.env.ProgramFiles ?? "C:\\Program Files", "Citro Labs", "ego lite"),
+      path.join(process.env.LOCALAPPDATA ?? "", "Programs", "ego lite"),
+      home ? path.join(home, ".local", "share", "ego") : "",
+    ];
+    return candidates.some((dir) => dir.trim() !== "" && existsSync(dir));
+  } catch {
+    return false;
+  }
+}
+
+function hostnameOf(rawUrl: string): string {
+  try {
+    return new URL(rawUrl).hostname.toLowerCase().replace(/^www\./, "");
+  } catch {
+    return "该视频站点";
+  }
 }
