@@ -1,17 +1,20 @@
-// 离线验证「后台任务 → 对话短汇报」：不启动服务、不调用模型、不派发任务、不写 memory/。
-// 从 src/main.ts 截取 report-summary 区块和 handleDelegationEvent，用桩依赖跑真实代码路径。
+// 离线验证「后台任务终态 → 聊天五件事」：不启动服务、不调用模型、不派发任务、不写 memory/。
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { stripTypeScriptTypes } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { deliveryText } from "../src/delivery-pipeline.ts";
+import {
+  USER_NOTICE_MAX, cleanupHoldNotice, failureNotice, finalizeUserNotice, noticeReady, renderFiveNotice,
+  unsettledNotice, userNoticeFromReview,
+} from "../src/user-notice.ts";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const source = readFileSync(path.join(root, "src", "main.ts"), "utf8");
 let checks = 0;
 const pass = (message) => { checks += 1; console.log(`ok ${checks} ${message}`); };
 
-/** 从声明起点按括号配对截出整个函数（跳过字符串、模板、注释）。 */
 function sliceDeclaration(text, signature) {
   const start = text.indexOf(signature);
   assert(start >= 0, `main.ts 缺少 ${signature}`);
@@ -35,127 +38,117 @@ function sliceDeclaration(text, signature) {
   throw new Error(`${signature} 函数体未闭合`);
 }
 
-function sliceBlock(text, beginMark, endMark) {
-  const from = text.indexOf(beginMark);
-  const to = text.indexOf(endMark);
-  assert(from >= 0 && to > from, `main.ts 缺少 ${beginMark} / ${endMark} 区块标记`);
-  const bodyStart = text.indexOf("\n", from + beginMark.length) + 1;
-  assert(bodyStart > 0 && bodyStart < to, `${beginMark} 与 ${endMark} 之间没有代码`);
-  return text.slice(bodyStart, to);
+const forbidden = /[/\\]|`|\{|\}|\bnpx\b|\bnpm\b|\btsc\b|\bPID\b|worktree|node_modules|\.ts\b|\.js\b|Error:|at run|:[\\/]|--\w/;
+
+function assertNotice(text, label) {
+  assert.equal(noticeReady(text), true, `${label} 五字段不齐：${text}`);
+  assert.ok([...text].length <= USER_NOTICE_MAX, `${label} 超长 ${[...text].length}：${text}`);
+  assert.equal([...text].length, text.length, `${label} 按字符计数应与码点数一致`);
+  assert.doesNotMatch(text, forbidden, `${label} 夹了不能进聊天的内容：${text}`);
+  assert.equal(text.indexOf("原先"), 0);
+  assert.ok(text.indexOf("现在") > 0 && text.indexOf("做了") > text.indexOf("现在"));
+  assert.match(text, /过，|挂，|未核实，/);
+  assert.match(text, /无需动手|要确认预览|要修/);
 }
-
-const blockSource = sliceBlock(source, "// BEGIN report-summary", "// END report-summary");
-const blockJs = stripTypeScriptTypes(blockSource, { mode: "transform" });
-const handlerJs = stripTypeScriptTypes(sliceDeclaration(source, "async function handleDelegationEvent("), { mode: "transform" });
-
-const logs = [];
-function loadBlock(scheduler) {
-  return new Function(
-    "log", "setTimeout", "clearTimeout",
-    `${blockJs}\nreturn { summarizeForUser, summaryFallback, summaryPrompt, cleanUserReport, withSummaryDeadline, userReportTimeoutMs, userReportMaxChars };`,
-  )(
-    (...args) => { logs.push(args.map(String).join(" ")); },
-    scheduler.setTimeout,
-    scheduler.clearTimeout,
-  );
-}
-
-/** 手动推进的计时器：测试绝不真等 60 秒。 */
-function makeScheduler() {
-  const pending = new Map();
-  let seq = 0;
-  return {
-    setTimeout: (callback, ms) => { seq += 1; pending.set(seq, { callback, ms }); return { id: seq, unref() {} }; },
-    clearTimeout: (handle) => { if (handle && pending.has(handle.id)) pending.delete(handle.id); },
-    delays: () => [...pending.values()].map((item) => item.ms),
-    fireAll: () => { const items = [...pending.entries()]; pending.clear(); for (const [, item] of items) item.callback(); },
-    size: () => pending.size,
-  };
-}
-
-const live = makeScheduler();
-const api = loadBlock(live);
-const input = (over = {}) => ({
-  id: "ca-selftest-1", kind: "completed", verdict: "passed",
-  rawText: '{"verdict":"passed","summary":"ok","checks":["\\u5df2\\u8dd1 tsc","diff --git a/x b/x"],"tools":["read","bash"]}\nPID 1234\n/memory/worktrees/ca-selftest-1',
-  ...over,
-});
-const FALLBACK = "后台任务 ca-selftest-1 验收通过，明细见任务面板。";
 
 try {
-  assert.equal(api.userReportTimeoutMs, 60_000, "改写超时必须是独立常量 60000ms");
-  assert.equal(api.userReportMaxChars, 200);
-  let prompt = "";
-  const good = "验收通过。已完成类型检查与自测，未提交、未推送、未部署；无需你操作。";
-  assert.equal(await api.summarizeForUser(input(), async (text) => { prompt = text; return good; }), good);
-  assert.match(prompt, /不要 Markdown 符号/);
-  assert.match(prompt, /不要 JSON/);
-  assert.match(prompt, /不要 diff/);
-  assert.match(prompt, /原先是什么样/);
-  assert.match(prompt, /现在是什么样/);
-  assert.match(prompt, /做了什么/);
-  assert.match(prompt, /成没成/);
-  assert.match(prompt, /需不需要动手/);
-  assert.match(prompt, /不超过 200 个汉字/);
-  assert.match(prompt, /未能确认/);
-  assert.match(prompt, /不可信数据/);
-  assert.match(prompt, /系统判定：验收通过/);
-  assert.match(prompt, /PID 1234/, "原始明细必须交给模型（否则无法判断提交/推送/部署状态）");
-  pass("正常改写：走一次模型调用，提示词含五段式/长度/不编造/不可信原文约束");
+  assert.equal(USER_NOTICE_MAX, 150);
 
-  assert.equal(await api.summarizeForUser(input(), async () => { throw new Error("model down"); }), FALLBACK);
-  assert.equal(await api.summarizeForUser(input(), () => { throw new Error("sync boom"); }), FALLBACK);
-  assert.equal(await api.summarizeForUser(input(), async () => ""), FALLBACK);
-  assert.equal(await api.summarizeForUser(input(), async () => "   \n  "), FALLBACK);
-  assert.equal(await api.summarizeForUser(input(), async () => '{"verdict":"passed","summary":"ok"}'), FALLBACK);
-  assert.equal(await api.summarizeForUser(input(), async () => "```text\n验收通过\n```"), FALLBACK);
-  assert.equal(await api.summarizeForUser(input(), async () => "结论：验收通过，明细 {\"a\":1}"), FALLBACK);
-  assert(logs.some((line) => line.includes("改用模板")), "回退必须留日志");
-  pass("回退：抛错/同步抛错/空串/空白/JSON/代码块/含花括号一律返回模板文案，不抛异常");
+  const passed = userNoticeFromReview({
+    verdict: "passed",
+    task: "把登录失败的提示改清楚",
+    summary: "登录失败时会说明原因，刷新后仍保持登录",
+  });
+  assertNotice(passed, "验收通过");
+  assert.match(passed, /^原先这件事还没完成。现在已经按目标做完。做了把登录失败的提示改清楚。过，登录失败时会说明原因，刷新后仍保持登录。无需动手。$/);
+  pass(`例1 验收通过 ${[...passed].length} 字：${passed}`);
 
-  const tightened = await api.summarizeForUser(input(), async () => "**结论**：验收通过\n- 未提交、未推送、未部署\n> 未跑全量测试");
-  assert.equal(tightened, "结论：验收通过 未提交、未推送、未部署 未跑全量测试");
-  assert(!tightened.includes("*") && !tightened.includes("-") && !tightened.includes("\n"));
-  const long = await api.summarizeForUser(input(), async () => "验".repeat(300));
-  assert.equal([...long].length, 201, `超长必须截断到 200 字 + 省略号，实际 ${[...long].length}`);
-  assert(long.endsWith("…"));
-  pass("清洗：去掉 Markdown 符号/编号/多行，超长按 200 字截断");
-
-  const timeouts = makeScheduler();
-  const timeoutApi = loadBlock(timeouts);
-  const blocked = timeoutApi.summarizeForUser(input({ verdict: "failed", id: "ca-selftest-hang" }), () => new Promise(() => {}));
-  assert.deepEqual(timeouts.delays(), [60_000], "硬期限必须是 60000ms");
-  timeouts.fireAll();
-  assert.equal(await blocked, "后台任务 ca-selftest-hang 验收未通过，有未解决项，详见任务面板。尚未提交、未推送、未部署。");
-  assert.equal(timeouts.size(), 0, "计时器必须清理");
-  assert.equal(live.size(), 0, "正常路径的计时器也必须清理");
-  pass("超时：模型不响应 60 秒即回退模板，且清理计时器");
-
-  const verdicts = {
-    passed: "验收通过，明细见任务面板。",
-    failed: "验收未通过，有未解决项，详见任务面板。尚未提交、未推送、未部署。",
-    unverified: "已结束，但未完成独立验收，详见任务面板。",
-    delivered: "已交付并通过原目标复验，明细见任务面板。尚未提交、未推送、未部署。",
-    undelivered: "交付未完成，需要关注，详见任务面板。",
-    unsettled: "已完成执行，但收尾尚未确认，明细见任务面板。",
-    error: "执行失败，详见任务面板。",
-    timeout: "达到执行时限，详见任务面板。",
-    cancelled: "已取消，详见任务面板。",
+  const nasty = [
+    "核对没过：npx tsc --noEmit 失败",
+    "Error: boom",
+    "    at run (D:\\pi-agent\\src\\main.ts:10:1)",
+    "工作树 /memory/worktrees/ca-x",
+  ].join("\n");
+  const failed = userNoticeFromReview({
+    verdict: "failed",
+    task: "把登录失败的提示改清楚\n详见 src/main.ts",
+    summary: nasty,
+  });
+  assertNotice(failed, "验收没过");
+  assert.match(failed, /挂，核对没过。要修没通过的阻塞。$/);
+  assert.doesNotMatch(failed, /src|main|pi-agent|tsc|boom/);
+  const reviewFile = {
+    verdict: "failed",
+    summary: nasty,
+    checks: ["npx tsc --noEmit", "D:\\pi-agent\\src\\main.ts"],
+    detail: `后台任务 ca-x：验收未通过。\n${nasty}`.slice(0, 6000),
+    rawReply: JSON.stringify({ verdict: "failed", summary: nasty, checks: ["npx tsc --noEmit"], failures: ["tsc"] }),
+    text: failed,
   };
-  for (const [verdict, tail] of Object.entries(verdicts)) {
-    assert.equal(api.summaryFallback(input({ verdict })), `后台任务 ca-selftest-1 ${tail}`);
-    assert(!/PID|端口|worktrees|diff|JSON/.test(tail), "模板不得含明细字段");
-  }
-  pass("模板：9 种结论各有一句短文案，均不含 PID/路径/diff");
+  assert.match(reviewFile.detail, /npx tsc/);
+  assert.match(reviewFile.detail, /main\.ts/);
+  assert.match(reviewFile.rawReply, /failures/);
+  assert.equal(reviewFile.checks.length, 2);
+  assert.doesNotMatch(reviewFile.text, forbidden);
+  pass(`例2 验收没过（栈和路径只留在文件）${[...failed].length} 字：${failed}`);
 
-  // ── 用真实 handleDelegationEvent 跑完整落库路径：改写抛错时通知与对话记录仍写入 ──
-  const buildHandler = (summarize, deps) => new Function(
-    "broadcastJobs", "notifications", "store", "server", "deliveryPipeline", "delegations", "projects",
-    "reviewDelegation", "summarizeForUser", "rewriteReportWithModel", "redactSensitive",
+  const delivered = deliveryText({
+    id: "ca-1", state: "cleaned", mode: "git-worktree",
+    targetReview: { verdict: "passed", summary: "原项目上的登录提示已经改清楚" },
+    executionReview: { verdict: "passed", summary: "npx tsc --noEmit passed at /memory/worktrees/ca-1" },
+    changes: [{ path: "src/login.ts", kind: "modify" }],
+    worktreePath: "/memory/worktrees/ca-1",
+    identity: { targetCwd: "D:\\pi-agent", kind: "git", targetBranch: "refs/heads/main" },
+    alreadyPresent: false, targetUpdated: true, cleanupDone: true,
+    error: "backup kept at D:\\pi-agent\\backup",
+  });
+  assertNotice(delivered, "交付完成");
+  assert.match(delivered, /^原先改动只在副本里。现在原项目已经是改完的样子。做了核对通过后放回原项目。过，原项目上的登录提示已经改清楚。无需动手。$/);
+  pass(`例3 交付完成 ${[...delivered].length} 字：${delivered}`);
+
+  const rolled = deliveryText({
+    id: "ca-2", state: "rolled_back", mode: "git-worktree",
+    targetReview: { verdict: "failed", summary: "登录提示仍是旧的，用户看不出失败原因" },
+    changes: [{ path: "src/login.ts" }],
+    worktreePath: "D:\\pi-agent\\memory\\worktrees\\ca-2",
+    alreadyPresent: false, targetUpdated: false,
+    error: "rollback kept /memory/worktrees/ca-2",
+  });
+  assertNotice(rolled, "交付撤回");
+  assert.match(rolled, /挂，/);
+  assert.match(rolled, /要修没通过的阻塞/);
+  pass(`例4 交付撤回 ${[...rolled].length} 字：${rolled}`);
+
+  const flooded = renderFiveNotice({
+    before: "原先".repeat(80),
+    now: "现在".repeat(80),
+    did: "处理".repeat(80),
+    outcome: "未核实",
+    reason: "原因".repeat(80) + " npx tsc /tmp/a.ts",
+    action: "要确认预览",
+  });
+  assertNotice(flooded, "超长硬截");
+  assert.doesNotMatch(flooded, /tsc|\/tmp/);
+  pass("超长原文先丢掉命令和路径，再硬截到 150 且五字段还在");
+
+  const poisoned = finalizeUserNotice("后台任务 ca-x：验收通过。\n- 已跑 npx tsc --noEmit\n- PID 4321 /memory/worktrees/ca-x\n{\"checks\":[\"a\"]}");
+  assertNotice(poisoned, "脏原文兜底");
+  assert.doesNotMatch(poisoned, /tsc|PID|worktree|checks/);
+  pass("不能渲染成五件事的原文不会原样进聊天");
+
+  assertNotice(failureNotice("timed_out", "plain"), "超时");
+  assertNotice(failureNotice("failed", "direct"), "直接失败");
+  assertNotice(failureNotice("cancelled", "delivery"), "取消");
+  pass("失败、超时、取消也是五件事，不贴原始报错");
+
+  const handlerJs = stripTypeScriptTypes(sliceDeclaration(source, "async function handleDelegationEvent("), { mode: "transform" });
+  const buildHandler = (deps) => new Function(
+    "broadcastJobs", "notifications", "store", "server", "deliveryPipeline", "delegations",
+    "reviewDelegation", "unsettledNotice", "failureNotice", "cleanupHoldNotice", "finalizeUserNotice", "redactSensitive",
     `${handlerJs}\nreturn handleDelegationEvent;`,
   )(
-    deps.broadcastJobs, deps.notifications, deps.store, deps.server, deps.deliveryPipeline, deps.delegations, deps.projects,
-    deps.reviewDelegation, summarize, deps.rewriteReportWithModel, deps.redactSensitive,
+    deps.broadcastJobs, deps.notifications, deps.store, deps.server, deps.deliveryPipeline, deps.delegations,
+    deps.reviewDelegation, deps.unsettledNotice, deps.failureNotice, deps.cleanupHoldNotice, deps.finalizeUserNotice, deps.redactSensitive,
   );
 
   function harness(over = {}) {
@@ -173,79 +166,90 @@ try {
         appendOnce: (message) => { order.push(`append:${message.text}`); chats.push(message); return { message, inserted: true }; },
       },
       server: { broadcast: () => order.push("broadcast") },
-      deliveryPipeline: { run: async () => ({ text: "交付原文：diff --git ... 工作树 /memory/worktrees/ca-x", delivered: true, holdProject: false }) },
-      delegations: { setDeliveryHold: () => {} },
-      projects: { get: () => undefined },
-      reviewDelegation: async () => ({
-        verdict: "passed", summary: "ok",
-        text: "后台任务 ca-x：验收通过。\n- 已跑 npx tsc --noEmit\n- PID 4321 端口 8787 /memory/worktrees/ca-x\n{\"checks\":[\"a\"]}",
-      }),
-      rewriteReportWithModel: async () => { throw new Error("model unreachable"); },
+      deliveryPipeline: { run: async () => ({ text: delivered, delivered: true, holdProject: false }) },
+      delegations: { setDeliveryHold: () => order.push("hold") },
+      reviewDelegation: async () => ({ verdict: "passed", summary: "登录失败时会说明原因", text: passed }),
+      unsettledNotice,
+      failureNotice,
+      cleanupHoldNotice,
+      finalizeUserNotice,
       redactSensitive: (text) => text,
       ...over,
     };
-    return { deps, notes, chats, order, handler: buildHandler(over.summarize ?? ((item, rewrite) => api.summarizeForUser(item, rewrite)), deps) };
+    return { notes, chats, order, handler: buildHandler(deps) };
   }
 
-  const completed = harness();
   const job = {
     id: "ca-x", status: "completed", deliveryManaged: false, source: { channel: "telegram", chatId: "-100", threadId: 1 },
-    message: "完成", task: "task", lastOutput: "",
+    message: "完成 npx tsc /memory/worktrees/ca-x", task: "task", lastOutput: "",
   };
+  const completed = harness();
   await completed.handler(job, "terminal");
   const notification = completed.notes.get("job:ca-x:terminal:terminal");
-  assert(notification, "通知必须落库");
-  assert.equal(notification.text, "后台任务 ca-x 验收通过，明细见任务面板。");
+  assert.equal(notification.text, passed);
   assert.equal(notification.kind, "job");
-  assert.deepEqual(completed.chats.map((item) => item.text), [notification.text], "对话里的文本必须与通知一致");
+  assert.deepEqual(completed.chats.map((item) => item.text), [passed]);
   assert.equal(completed.order.filter((item) => item.startsWith("put:")).length, 1);
-  assert(completed.order.findIndex((item) => item.startsWith("put:")) < completed.order.findIndex((item) => item.startsWith("append:")), "通知先于对话记录");
-  assert(!notification.text.includes("tsc") && !notification.text.includes("PID") && !notification.text.includes("worktrees"), "对话里不能出现明细");
-  pass("落库：模型抛错时仍写通知与对话记录，且对话文本是模板短文案（明细只留在面板）");
+  assert(completed.order.findIndex((item) => item.startsWith("put:")) < completed.order.findIndex((item) => item.startsWith("append:")));
+  assertNotice(notification.text, "聊天通知");
+  pass("落库：对话文本就是五件事，不经过第二次改写");
 
-  const delivered = harness();
-  await delivered.handler({ ...job, deliveryManaged: true, deliveryAttempt: 2 }, "terminal");
-  const deliveredNote = delivered.notes.get("job:ca-x:terminal:terminal:delivery-2");
-  assert(deliveredNote, "交付任务的去重 id 必须保留 deliveryAttempt 后缀");
-  assert.equal(deliveredNote.text, "后台任务 ca-x 已交付并通过原目标复验，明细见任务面板。尚未提交、未推送、未部署。");
-  pass("交付分支：去重 id 带 :delivery-N，回退到交付模板");
+  const deliveredRun = harness();
+  await deliveredRun.handler({ ...job, deliveryManaged: true, deliveryAttempt: 2 }, "terminal");
+  const deliveredNote = deliveredRun.notes.get("job:ca-x:terminal:terminal:delivery-2");
+  assert.equal(deliveredNote.text, delivered);
+  assert(deliveredRun.order.includes("hold"));
+  pass("交付分支：去重 id 带 :delivery-N，聊天用交付五件事");
 
-  const failed = harness({ reviewDelegation: async () => ({ verdict: "failed", summary: "x", text: "原始验收" }) });
-  await failed.handler({ ...job, status: "timed_out", message: "超过 60 分钟", cleanupError: "pane 未关闭" }, "terminal");
-  assert.equal(failed.notes.get("job:ca-x:terminal:terminal").text, "后台任务 ca-x 达到执行时限，详见任务面板。");
-  pass("失败分支：超时回退模板，收尾未确认等明细不进入对话");
+  const leaked = harness({
+    deliveryPipeline: { run: async () => ({ text: "交付原文：diff --git a/x b/x 工作树 /memory/worktrees/ca-x", delivered: false, holdProject: true }) },
+  });
+  await leaked.handler({ ...job, deliveryManaged: true, deliveryAttempt: 0 }, "terminal");
+  const leakedNote = leaked.notes.get("job:ca-x:terminal:terminal:delivery-0");
+  assertNotice(leakedNote.text, "脏交付文案");
+  assert.doesNotMatch(leakedNote.text, /diff|worktree|git/);
+  pass("交付原文若夹路径，聊天仍回落到五件事");
 
-  const attention = harness({ summarize: async () => { throw new Error("attention 不允许改写"); } });
+  const failedRun = harness();
+  await failedRun.handler({ ...job, status: "timed_out", message: "超过 60 分钟 npx tsc", cleanupError: "pane 未关闭 /memory/worktrees/ca-x" }, "terminal");
+  const failedNote = failedRun.notes.get("job:ca-x:terminal:terminal");
+  assertNotice(failedNote.text, "收尾未确认");
+  assert.match(failedNote.text, /收尾尚未确认/);
+  assert.doesNotMatch(failedNote.text, /tsc|pane|worktree|60/);
+  pass("失败分支：收尾报错不进聊天，只留五件事");
+
+  const attention = harness({ finalizeUserNotice: () => { throw new Error("attention 不允许改写"); } });
   await attention.handler({ ...job, attentionSequence: 7, message: "15 分钟无进展" }, "attention");
   const attentionNote = attention.notes.get("job:ca-x:attention:7");
   assert.equal(attentionNote.kind, "attention");
   assert.equal(attentionNote.text, "后台任务 ca-x 需要关注：15 分钟无进展。\n任务未因 PA 对话结束而停止，整体执行时限仍有效；你可以继续聊天或取消该任务。");
-  pass("attention 事件：保持原有文案，不调用改写");
+  pass("attention 事件：保持原有文案，不套五件事");
 
   const repeated = harness();
   repeated.notes.set("job:ca-x:terminal:terminal", { id: "job:ca-x:terminal:terminal", text: "已存在的短汇报", kind: "job", source: job.source });
   await repeated.handler(job, "terminal");
-  assert.equal(repeated.chats[0].text, "已存在的短汇报", "已通知过的事件不重复改写");
-  assert(!repeated.order.some((item) => item.startsWith("put:")), "已有通知不重复写");
-  pass("幂等：同一事件已有通知时跳过改写，直接复用文本");
+  assert.equal(repeated.chats[0].text, "已存在的短汇报");
+  assert(!repeated.order.some((item) => item.startsWith("put:")));
+  pass("幂等：同一事件已有通知时不重写");
 
   const qq = harness();
   await qq.handler({ ...job, source: { channel: "qq", target: "private:12345" } }, "terminal");
-  assert.equal(qq.notes.get("job:ca-x:terminal:terminal").text, "后台任务 ca-x 验收通过，明细见任务面板。");
-  pass("QQ 分支：仍按 3000 字截断旧逻辑，短汇报原样入库");
+  assert.equal(qq.notes.get("job:ca-x:terminal:terminal").text, passed);
+  pass("QQ 分支：仍按 3000 字截断入口，短通知原样入库");
 
-  // ── 源码级约束：面板留明细、对话只留汇报、其它行为未改 ──
   const handlerSource = sliceDeclaration(source, "async function handleDelegationEvent(");
-  assert.equal((source.match(/summarizeForUser\(/g) ?? []).length, 2, "summarizeForUser 只应有定义处与唯一调用处");
-  assert.match(handlerSource, /text = event === "terminal" \? await summarizeForUser\(/);
+  assert.doesNotMatch(source, /summarizeForUser|rewriteReportWithModel|userReportMaxChars/);
+  assert.match(handlerSource, /finalizeUserNotice\(text\)/);
   assert.match(handlerSource, /text: job\.source\.channel === "qq" \? text\.slice\(0, 3000\) : text/);
   assert.match(handlerSource, /const id = `job:\$\{job\.id\}:\$\{event\}:\$\{stamp\}\$\{event === "terminal" && job\.deliveryManaged \? `:delivery-\$\{job\.deliveryAttempt \?\? 0\}` : ""\}`;/);
-  assert.match(source, /\.slice\(0, 6000\)/, "独立验收原文仍完整拼装（6000 字）并落盘");
+  assert.match(source, /\.slice\(0, 6000\)/);
   assert.match(source, /memory", "delegation-reviews"/);
-  assert.match(source, /message: review\.text/, "任务面板仍返回完整验收原文");
-  assert.match(source, /noTools: true, tools: \[\]/, "改写调用不开放 read/bash");
-  assert.equal((source.match(/\brewriteReportWithModel\b/g) ?? []).length, 2, "改写只走 reviewRunner 这一处实现与一处引用");
-  pass("源码约束：仅 terminal 改写、QQ 截断与通知 id 未变、面板/落盘仍保留完整原文");
+  assert.match(source, /checks: checks\.map/);
+  assert.match(source, /detail,/);
+  assert.match(source, /rawReply:/);
+  assert.match(source, /review\.detail/);
+  assert.match(source, /tools: \["read", "bash"\]/);
+  pass("源码约束：验收仍独立跑并落盘明细；聊天只渲染五字段");
 
   console.log(`\nPASS ${checks} report-summary checks；未启动服务、未调用模型、未写入 memory/`);
 } catch (error) {
