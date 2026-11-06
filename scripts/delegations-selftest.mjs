@@ -351,9 +351,14 @@ try {
     assert.equal(done.report.jobId, job.id);
     assert(done.closedAt);
     assert.equal(done.cleanupPending, false);
+    assert.equal(done.workspaceId, undefined);
+    assert.equal(done.paneId, undefined);
     assert(f.events[0].job.closedAt);
+    assert.equal(f.events[0].job.workspaceId, undefined);
+    assert.equal(f.events[0].job.paneId, undefined);
     assert(f.manager.read(job.name).includes("fake CA"));
-    assert.equal(f.manager.get(job.paneId).id, job.id);
+    assert.equal(f.manager.get(job.paneId), undefined);
+    assert.equal(f.manager.get(job.id).id, job.id);
     await assert.rejects(() => f.manager.reply(job.id, "again"), /不能复活/);
   });
 
@@ -1481,6 +1486,51 @@ try {
       assert.deepEqual(next.get(job.id), before);
       assert.equal(fs.readFileSync(f.opts.file, "utf8"), stored);
     }
+  });
+
+
+  await check("终态残留同workspaceId可load；非终态workspaceId撞车仍拒绝启动", async () => {
+    const f = fixture();
+    f.manager.start();
+    const first = await running(f, f.submit());
+    const second = await running(f, f.submit(f.b));
+    report(first);
+    report(second);
+    await terminal(f, first, "completed");
+    await terminal(f, second, "completed");
+    f.manager.stop();
+    const store = JSON.parse(fs.readFileSync(f.opts.file, "utf8"));
+    assert.equal(store.jobs.length, 2);
+    for (const job of store.jobs) {
+      assert.equal(job.workspaceId, undefined);
+      assert.equal(job.paneId, undefined);
+      Object.assign(job, { workspaceId: "wD", paneId: "pane-recycled" });
+    }
+    fs.writeFileSync(f.opts.file, JSON.stringify(store));
+    const reloaded = new DelegationManager(f.opts);
+    managers.push(reloaded);
+    assert.equal(reloaded.get(first.id).workspaceId, "wD");
+    assert.equal(reloaded.get(second.id).workspaceId, "wD");
+    assert.equal(reloaded.get(first.id).status, "completed");
+    assert.equal(reloaded.get(second.id).status, "completed");
+
+    const collision = fixture();
+    const a = collision.submit();
+    const b = collision.submit(collision.b);
+    collision.manager.stop();
+    const live = JSON.parse(fs.readFileSync(collision.opts.file, "utf8"));
+    for (const job of live.jobs) {
+      Object.assign(job, {
+        status: "starting",
+        startedAt: new Date(collision.clock.time).toISOString(),
+        deadlineAt: new Date(collision.clock.time + 60_000).toISOString(),
+        workspaceId: "wE",
+        paneId: `pane-${job.name}`,
+        launchPhase: "created",
+      });
+    }
+    fs.writeFileSync(collision.opts.file, JSON.stringify(live));
+    assert.throws(() => new DelegationManager(collision.opts), /任务标识、名称或工作区重复/);
   });
 
   await check("背景任务只为活跃、用户点名和24h内仍待处理的任务注入，旧交付不是待办", async () => {

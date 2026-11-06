@@ -466,9 +466,10 @@ export class DelegationManager {
         if (job.status !== "queued" && !isTerminal(job) && (!job.startedAt || !job.deadlineAt)) throw new Error("运行任务缺少持久化执行时限");
         if (isTerminal(job) && !job.finishedAt) throw new Error("终态任务缺少 finishedAt");
         this.validateSource(job.source);
-        if (this.jobs.has(job.id) || names.has(job.name.toLowerCase()) || (job.workspaceId && workspaces.has(job.workspaceId))) throw new Error("任务标识、名称或工作区重复");
+        // workspaceId uniqueness only among non-terminal jobs: herdr recycles short ids, terminal history must not block restart.
+        if (this.jobs.has(job.id) || names.has(job.name.toLowerCase()) || (job.workspaceId && !isTerminal(job) && workspaces.has(job.workspaceId))) throw new Error("任务标识、名称或工作区重复");
         names.add(job.name.toLowerCase());
-        if (job.workspaceId) workspaces.add(job.workspaceId);
+        if (job.workspaceId && !isTerminal(job)) workspaces.add(job.workspaceId);
         this.jobs.set(job.id, job);
       }
     } catch (error) {
@@ -869,7 +870,7 @@ export class DelegationManager {
     const job = this.jobs.get(id)!;
     if (!isTerminal(job) || !job.cleanupPending || job.closedAt || job.cleanupBlocked) return Promise.resolve();
     if (!job.workspaceId) {
-      if (!this.launches.has(id)) this.update(id, { cleanupPending: false });
+      if (!this.launches.has(id)) this.update(id, { cleanupPending: false, paneId: undefined });
       return Promise.resolve();
     }
     if (!force && this.now() - (this.cleanupAttempts.get(id) ?? -Infinity) < this.pollIntervalMs) return Promise.resolve();
@@ -894,7 +895,8 @@ export class DelegationManager {
       await this.adapter.closeWorkspace(workspaceId);
     }).then(() => {
       const current = this.jobs.get(id)!;
-      if (current.workspaceId === workspaceId && isTerminal(current)) this.update(id, { closedAt: iso(this.now()), cleanupPending: false, cleanupError: undefined });
+      // Drop recycled herdr identities after close so terminal history cannot collide with a later CA.
+      if (current.workspaceId === workspaceId && isTerminal(current)) this.update(id, { closedAt: iso(this.now()), cleanupPending: false, cleanupError: undefined, workspaceId: undefined, paneId: undefined });
     }).catch((error) => {
       if (!this.storageError) this.update(id, { cleanupError: `关闭本任务 herdr 终端工作区失败，将重试（不涉及磁盘工作树清理）：${errorText(error)}` });
       this.log("[delegations] cleanup", id, errorText(error));
