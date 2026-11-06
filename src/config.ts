@@ -137,7 +137,8 @@ export function loadConfig(path: string): AgentConfig {
   for (const field of ["timeoutMs", "maxTimeoutMs", "idleWarningMs", "pollIntervalMs", "startupTimeoutMs", "maxConcurrent", "reviewTimeoutMs"] as const) {
     positive(`delegations.${field}`, cfg.delegations?.[field]);
   }
-  if ((cfg.delegations?.timeoutMs ?? 3_600_000) > (cfg.delegations?.maxTimeoutMs ?? 14_400_000)) {
+  // 未显式设 timeoutMs 时不比较：默认 1h 由 DelegationManager 按 maxTimeoutMs 自动 clamp。
+  if (cfg.delegations?.timeoutMs !== undefined && cfg.delegations.timeoutMs > (cfg.delegations.maxTimeoutMs ?? 14_400_000)) {
     throw new Error(`config ${path}: delegations.timeoutMs 不能大于 maxTimeoutMs`);
   }
   if (cfg.delegations?.mode !== undefined && !["direct", "worktree"].includes(cfg.delegations.mode)) {
