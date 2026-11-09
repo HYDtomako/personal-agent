@@ -11,6 +11,7 @@ import { MemoryStore, type MemoryOptions } from "../src/memory.ts";
  * 1. 会话过阈值 → 后台预热写出摘要 → resetSession → sessionFor 摘要为空
  * 2. 不 reset 时，sessionFor 仍拿到预热摘要
  * 3. reset 发生在预热尚未完成时，新会话同样拿不到这份摘要
+ * 4. 没有预热、走同步兜底压缩时：压缩进行中 reset，新会话摘要为空；不 reset 仍返回摘要
  */
 
 const SUMMARY = "此前在讨论发布计划，决定下周上线。";
@@ -114,6 +115,32 @@ try {
     check("完成后摘要文件在盘上", summaryFiles(dir).length === 1);
     const session = await memory.sessionFor(userId);
     check("预热完成之后的新会话摘要为空", session.summary === "", JSON.stringify(session.summary));
+  }
+
+  console.log("[同步兜底压缩]");
+  {
+    const dir = path.join(root, "sync-keep");
+    const userId = "sync-keep";
+    const memory = newStore(dir, async () => SUMMARY);
+    writeHotSession(dir, userId);
+    const session = await memory.sessionFor(userId);
+    check("不 reset 时同步兜底返回摘要", session.summary === SUMMARY, JSON.stringify(session.summary));
+    check("同步兜底把摘要落盘", summaryFiles(dir).length === 1, summaryFiles(dir).join(","));
+  }
+
+  {
+    const dir = path.join(root, "sync-reset");
+    const userId = "sync-reset";
+    const gate = deferred();
+    const memory = newStore(dir, () => gate.promise);
+    writeHotSession(dir, userId);
+    const waiting = memory.sessionFor(userId);
+    memory.resetSession(userId);
+    gate.resolve(SUMMARY);
+    const session = await waiting;
+    check("同步兜底进行中 reset，本次摘要为空", session.summary === "", JSON.stringify(session.summary));
+    const again = await memory.sessionFor(userId);
+    check("同步兜底完成后新会话摘要仍为空", again.summary === "", JSON.stringify(again.summary));
   }
 } finally {
   rmSync(root, { recursive: true, force: true });

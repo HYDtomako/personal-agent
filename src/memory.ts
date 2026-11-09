@@ -59,6 +59,8 @@ export class MemoryStore {
   private readonly prefetching = new Map<string, Promise<string>>();
   /** 已经注入过的摘要文件（文件名），同一窗口不重复注入 */
   private readonly consumedSummaries = new Set<string>();
+  /** 每个用户的会话代际。resetSession 每次调用都加一，用来作废进行中的同步兜底压缩。 */
+  private readonly sessionVersions = new Map<string, number>();
 
   constructor(opts: MemoryOptions) {
     this.opts = opts;
@@ -78,11 +80,17 @@ export class MemoryStore {
 
     // 兜底路径：上一轮结束后的预热没跑（进程刚启动、预热失败等），只能现在同步压缩
     if (existsSync(file) && estimateTokens(file) >= budget) {
+      const version = this.sessionVersions.get(userId) ?? 0;
       const archive = this.newArchivePath(userId);
       try {
         renameSync(file, archive);
-        // 归档同名（同一毫秒）且已有预热摘要时直接用，别再压一遍
-        const summary = readSummary(archive) || (await this.opts.summarize(archive));
+        // 归档同名（同一毫秒）且已有预热摘要时直接用，别再压一遍。否则走和预热同一条落盘路径。
+        const summary = readSummary(archive) || (await this.summarizeToFile(archive));
+        // resetSession 发生在压缩期间：这份摘要属于被丢掉的会话，不能注入，也不能留给下一轮。
+        if ((this.sessionVersions.get(userId) ?? 0) !== version) {
+          this.consumedSummaries.add(path.basename(archive + SUMMARY_SUFFIX));
+          return { file, summary: "" };
+        }
         if (summary) this.opts.log(`[memory] 窗口达阈值，已压缩（${Math.round(statSync(archive).size / 1024)}KB）`);
         return { file, summary };
       } catch (err) {
@@ -227,6 +235,7 @@ export class MemoryStore {
 
   /** 新对话：丢弃当前会话窗口（归档而非删除），下次消息从空上下文开始。 */
   resetSession(userId: string): void {
+    this.sessionVersions.set(userId, (this.sessionVersions.get(userId) ?? 0) + 1);
     this.consumeLatestSummary(userId);
     const file = path.join(this.opts.dir, `user-${userId}.jsonl`);
     this.windows.delete(userId);
