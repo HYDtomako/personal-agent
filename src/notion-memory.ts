@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { Agent as HttpAgent, request as httpRequest } from "node:http";
 import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
@@ -10,9 +10,27 @@ import { rankByQuery } from "./memory.ts";
  * 2026-10-22 起 Notion 是唯一 active 记忆源；本地长期库只读归档。
  * 这里只负责"取 active 条目、按相关性挑选、拼成注入文本"，写入由
  * workspace/.pi/extensions/memory-tools.ts 直接调 Notion API 完成。
+ *
+ * 另外读一个独立的「记忆目录」索引表（data source，不是记忆条目）：它的行单独注入，
+ * 不参与相关度打分，也不算进条数/字数预算。
  */
 
 export type MemoryKind = "memory" | "taste" | "profile" | "project" | "context";
+
+/**
+ * 「记忆目录」索引表的 data source id：索引不是记忆条目。
+ * 数据库 413b4619-9bae-8042-8fa5-d8517ce54fce / data source 413b4619-9bae-80ee-bde0-000bb0ba7fb0。
+ */
+export const DEFAULT_INDEX_DATA_SOURCE_ID = "413b4619-9bae-80ee-bde0-000bb0ba7fb0";
+
+/**
+ * 索引表属性名（精确匹配 Notion 上的列名，区分大小写）。
+ * 标题列：新表叫「名称」，旧内联表叫「清单」，按顺序取第一个有值的（向后兼容）。
+ */
+const INDEX_TITLE_PROPS = ["名称", "清单"] as const;
+const INDEX_GROUP_PROP = "分组";
+const INDEX_CONTENT_PROP = "内容";
+const INDEX_KEYWORDS_PROP = "关键词";
 
 export interface NotionMemoryEntry {
   pageId: string;
@@ -36,6 +54,17 @@ export interface NotionMemoryOptions {
   connectTimeoutMs?: number;
   /** API 根地址（默认 https://api.notion.com；仅自测与代理场景用） */
   baseUrl?: string;
+  /** 「记忆目录」索引表的 data source id（默认 DEFAULT_INDEX_DATA_SOURCE_ID） */
+  indexDataSourceId?: string;
+  /** 索引文本内存缓存有效期（毫秒，默认 300000 = 5 分钟） */
+  indexTtlMs?: number;
+  /** memory-tools 写完记忆后 touch 的标记文件；mtime 变化就丢掉索引缓存 */
+  indexDirtyFile?: string;
+  /**
+   * 「记忆目录」磁盘快照文件；不填则取 indexDirtyFile 同目录的
+   * notion-memory-index.snapshot.json（两者都在 data/ 下）。两者都没有则不落盘。
+   */
+  indexSnapshotFile?: string;
   log?: (message: string) => void;
 }
 
@@ -52,6 +81,12 @@ const DEFAULT_CONNECT_TIMEOUT_MS = 3000;
 const MAX_ATTEMPTS = 3;
 /** 网络层异常（不是 429）的指数退避：300ms / 800ms */
 const RETRY_DELAYS_MS = [300, 800];
+/** 记忆目录（索引表）文本的内存缓存：5 分钟 */
+const DEFAULT_INDEX_TTL_MS = 300_000;
+/** 索引表读取失败后的冷却时间：失败也不每轮去打 Notion */
+const INDEX_FAILURE_TTL_MS = 60_000;
+/** 记忆目录磁盘快照的默认文件名：与条目快照 notion-memory-cache.json 同级，名字明显区分 */
+const INDEX_SNAPSHOT_FILENAME = "notion-memory-index.snapshot.json";
 
 /** 可重试的网络层错误码（连接被重置、建连失败、DNS 抖动等） */
 const RETRYABLE_NETWORK_CODES = new Set([
@@ -102,6 +137,46 @@ function textProp(value: unknown): string {
   return plain(v.title) || plain(v.rich_text);
 }
 
+/**
+ * 索引表一行 → `[分组] 标题 · 内容 · 关键词 · #短id`。
+ * 缺字段或类型不符就当空串（该字段跳过，不留多余分隔符）；整行没有可读文本则整行跳过。
+ * 短 id 供 recall 按 id 精确取回：拿不到 page id 就不加后缀，绝不抛错。
+ */
+function indexRowLine(row: unknown): string {
+  if (!row || typeof row !== "object") return "";
+  const props = (row as { properties?: unknown }).properties;
+  if (!props || typeof props !== "object") return "";
+  const map = props as Record<string, unknown>;
+  const title = titleProp(map);
+  const group = selectProp(map[INDEX_GROUP_PROP]).trim();
+  const content = textProp(map[INDEX_CONTENT_PROP]).trim();
+  const keywords = textProp(map[INDEX_KEYWORDS_PROP]).trim();
+  const body = [title, content, keywords].filter(Boolean).join(" · ");
+  if (!body) return "";
+  const line = group ? `[${group}] ${body}` : body;
+  const short = shortPageId((row as { id?: unknown }).id);
+  return short ? `${line} · #${short}` : line;
+}
+
+/**
+ * Notion page id → 短 id：去掉连字符后取末 6 位小写。
+ * id 缺失或去连字符后不足 6 位视为解析失败，返回空串。
+ */
+export function shortPageId(pageId: unknown): string {
+  if (typeof pageId !== "string") return "";
+  const hex = pageId.replace(/-/g, "").trim().toLowerCase();
+  return hex.length >= 6 ? hex.slice(-6) : "";
+}
+
+/** 标题列取值：「名称」优先，取不到回退旧表的「清单」。 */
+function titleProp(map: Record<string, unknown>): string {
+  for (const name of INDEX_TITLE_PROPS) {
+    const text = textProp(map[name]).trim();
+    if (text) return text;
+  }
+  return "";
+}
+
 function selectProp(value: unknown): string {
   const v = value as { select?: { name?: string } } | undefined;
   return v?.select?.name ?? "";
@@ -137,8 +212,16 @@ export class NotionMemory {
   private readonly timeoutMs: number;
   private readonly connectTimeoutMs: number;
   private readonly baseUrl: string;
+  private readonly indexDataSourceId: string;
+  private readonly indexTtlMs: number;
+  private readonly indexDirtyFile?: string;
+  private readonly indexSnapshotFile?: string;
   private readonly log?: (message: string) => void;
   private agents?: { http: HttpAgent; https: HttpsAgent };
+  /** fetchedAt 是「这次缓存建立的时间」：成功用 indexTtlMs、失败用 INDEX_FAILURE_TTL_MS 做冷却 */
+  private indexCache?: { text: string; fetchedAt: number; ok: boolean };
+  private indexInflight?: Promise<string>;
+  private indexDirtyAppliedAt = 0;
 
   constructor(opts: NotionMemoryOptions) {
     this.token = opts.token;
@@ -146,6 +229,12 @@ export class NotionMemory {
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.connectTimeoutMs = opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
     this.baseUrl = (opts.baseUrl ?? API_BASE).replace(/\/+$/, "");
+    this.indexDataSourceId = opts.indexDataSourceId ?? DEFAULT_INDEX_DATA_SOURCE_ID;
+    this.indexTtlMs = opts.indexTtlMs ?? DEFAULT_INDEX_TTL_MS;
+    this.indexDirtyFile = opts.indexDirtyFile;
+    this.indexSnapshotFile =
+      opts.indexSnapshotFile ??
+      (this.indexDirtyFile ? path.join(path.dirname(this.indexDirtyFile), INDEX_SNAPSHOT_FILENAME) : undefined);
     this.log = opts.log;
   }
 
@@ -298,14 +387,149 @@ export class NotionMemory {
   }
 
   /**
+   * 「记忆目录」索引表文本（每行一条目录项 `[分组] 标题 · 内容 · 关键词 · #短id`，行间换行）。
+   *
+   * 这是索引段，不是记忆条目：不进相关度打分、不占条数/字数预算。
+   * 读取顺序与条目一致：network（本轮现拉）→ 内存缓存（TTL 内）→ 磁盘快照（拉取失败且无可用缓存）。
+   * 失败降级为快照文本（没有快照才空字符串）并留一条 warn，绝不抛错、不中断对话。
+   */
+  async indexText(): Promise<string> {
+    if (this.indexDirtyMarkerSeen()) this.indexCache = undefined;
+    const cached = this.indexCache;
+    if (cached) {
+      const ttl = cached.ok ? this.indexTtlMs : INDEX_FAILURE_TTL_MS;
+      if (Date.now() - cached.fetchedAt < ttl) return cached.text;
+    }
+    if (!this.indexInflight) {
+      const load = this.fetchIndexText();
+      this.indexInflight = load;
+      const clear = () => {
+        if (this.indexInflight === load) this.indexInflight = undefined;
+      };
+      load.then(clear, clear);
+    }
+    return await this.indexInflight;
+  }
+
+  /** 丢掉索引缓存：下一次 indexText() 重新拉取（写入路径用它保持目录同步）。 */
+  invalidateIndex(): void {
+    this.indexCache = undefined;
+  }
+
+  /** 标记文件的 mtime 比上次处理更新 → 说明别的进程刚写过记忆。 */
+  private indexDirtyMarkerSeen(): boolean {
+    const file = this.indexDirtyFile;
+    if (!file) return false;
+    try {
+      const mtime = statSync(file).mtimeMs;
+      if (mtime <= this.indexDirtyAppliedAt) return false;
+      this.indexDirtyAppliedAt = mtime;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async fetchIndexText(): Promise<string> {
+    const started = Date.now();
+    try {
+      const text = (await this.fetchIndexTableText(this.indexDataSourceId)).trim();
+      const fetchedAt = Date.now();
+      this.indexCache = { text, fetchedAt, ok: true };
+      this.writeIndexSnapshot(text, fetchedAt);
+      this.log?.(`[memory] 记忆目录已刷新（${text.length} 字，耗时 ${fetchedAt - started}ms）`);
+      return text;
+    } catch (error) {
+      const detail = `${describeError(error)}；耗时 ${Date.now() - started}ms`;
+      const snapshot = this.readIndexSnapshot();
+      if (snapshot) {
+        this.indexCache = { text: snapshot.text, fetchedAt: Date.now(), ok: false };
+        this.log?.(
+          `[memory] 记忆目录来自磁盘快照（${clockOf(snapshot.fetchedAt)} 拉取，已过 ${formatAge(snapshot.fetchedAt)}）：` +
+            `本轮拉取失败（${detail}）`,
+        );
+        return snapshot.text;
+      }
+      this.indexCache = { text: "", fetchedAt: Date.now(), ok: false };
+      this.log?.(`[memory] 记忆目录读取失败（${detail}），没有可用磁盘快照，本轮不注入目录`);
+      return "";
+    }
+  }
+
+  /**
+   * 记忆目录文本落盘（先 .tmp 再 rename，进程被杀也不会留下半个 JSON）。
+   * 本轮拿到空串时不覆盖已有快照：一次空返回不该把目录清空。
+   */
+  private writeIndexSnapshot(text: string, fetchedAt: number): void {
+    const file = this.indexSnapshotFile;
+    if (!file) return;
+    if (!text) {
+      if (existsSync(file)) this.log?.(`[memory] 记忆目录本轮为空串，保留原有磁盘快照（不覆盖）：${file}`);
+      return;
+    }
+    try {
+      mkdirSync(path.dirname(file), { recursive: true });
+      const tmp = `${file}.tmp`;
+      writeFileSync(tmp, JSON.stringify({ fetchedAt, text }, null, 2) + "\n", "utf8");
+      renameSync(tmp, file);
+    } catch (error) {
+      this.log?.(`[memory] 记忆目录快照写入失败（${describeError(error)}）：${file}`);
+    }
+  }
+
+  /** 读记忆目录快照：文件不存在 / JSON 损坏 / 字段类型不符 都按「不存在」处理，绝不抛错。 */
+  private readIndexSnapshot(): { fetchedAt: number; text: string } | undefined {
+    const file = this.indexSnapshotFile;
+    if (!file || !existsSync(file)) return undefined;
+    try {
+      const raw = JSON.parse(readFileSync(file, "utf8")) as { fetchedAt?: unknown; text?: unknown };
+      if (
+        typeof raw?.fetchedAt !== "number" ||
+        !Number.isFinite(raw.fetchedAt) ||
+        typeof raw.text !== "string" ||
+        !raw.text.trim()
+      ) {
+        this.log?.(`[memory] 记忆目录快照格式异常（${file}），按不存在处理`);
+        return undefined;
+      }
+      return { fetchedAt: raw.fetchedAt, text: raw.text };
+    } catch (error) {
+      this.log?.(`[memory] 记忆目录快照读取失败（${describeError(error)}；${file}），按不存在处理`);
+      return undefined;
+    }
+  }
+
+  /** query 索引表（data source），按返回顺序把每行拼成一行文本，行间换行。 */
+  private async fetchIndexTableText(dataSourceId: string): Promise<string> {
+    const lines: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await this.call<{ results?: unknown[]; has_more?: boolean; next_cursor?: string }>(
+        "POST",
+        `/data_sources/${dataSourceId}/query`,
+        { page_size: PAGE_SIZE, ...(cursor ? { start_cursor: cursor } : {}) },
+      );
+      for (const row of page.results ?? []) {
+        const line = indexRowLine(row);
+        if (line) lines.push(line);
+      }
+      cursor = page.has_more ? page.next_cursor : undefined;
+    } while (cursor);
+    return lines.join("\n");
+  }
+
+  /**
    * 选本次注入：profile 始终在场，其余按与当前问题二元组覆盖度排序。
    * 总字数封顶 maxInjectChars，装不下的按分数从低往高砍。
+   *
+   * indexText（记忆目录）原样作为独立字段 index 返回：不参与打分，
+   * 也不计入 maxChars 与「最多 6 条」的预算。
    */
   select(
     entries: NotionMemoryEntry[],
     query: string,
-    opts: { maxInjectChars?: number; minRelevanceScore?: number } = {},
-  ): { lines: string[]; total: number; picked: NotionMemoryEntry[] } {
+    opts: { maxInjectChars?: number; minRelevanceScore?: number; indexText?: string } = {},
+  ): { lines: string[]; total: number; picked: NotionMemoryEntry[]; index: string } {
     const maxChars = opts.maxInjectChars ?? 800;
     const minScore = Math.max(opts.minRelevanceScore ?? 0.25, 0.25);
 
@@ -332,7 +556,7 @@ export class NotionMemory {
       picked.push(entry);
       used += line.length;
     }
-    return { lines, total: entries.length, picked };
+    return { lines, total: entries.length, picked, index: (opts.indexText ?? "").trim() };
   }
 }
 
@@ -468,6 +692,8 @@ export class NotionMemoryCache {
         const snapshot: NotionMemorySnapshot = { fetchedAt: this.now(), entries };
         this.writeSnapshot(snapshot);
         this.clearDirty();
+        // 条目变了（多半是 memory-tools 刚写过），目录索引也该重新拉一次
+        this.memory.invalidateIndex();
         return snapshot;
       })();
       const clear = () => {

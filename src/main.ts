@@ -279,6 +279,9 @@ const memory = new MemoryStore({
   log,
 });
 
+// 索引表 data source 允许 config 覆盖；未配置时 NotionMemory 内部回落到 DEFAULT_INDEX_DATA_SOURCE_ID
+const configIndexDataSourceId = (config.notion as Record<string, unknown> | undefined)?.indexDataSourceId;
+
 const notionMemory =
   notionKey && config.notion?.dataSourceId
     ? new NotionMemory({
@@ -286,6 +289,10 @@ const notionMemory =
         dataSourceId: config.notion.dataSourceId,
         timeoutMs: config.notion.timeoutMs,
         connectTimeoutMs: config.notion?.connectTimeoutMs,
+        // 索引表（data source）id：不填就走默认值
+        indexDataSourceId: typeof configIndexDataSourceId === "string" ? configIndexDataSourceId : undefined,
+        // 索引缓存标记：memory-tools 写完记忆会 touch 它，主进程据此丢弃目录缓存
+        indexDirtyFile: path.join(root, "data", "notion-memory-index.dirty"),
         log: (message) => log(message),
       })
     : undefined;
@@ -515,19 +522,22 @@ async function handleRequest(request: ConversationRequest): Promise<Conversation
       maxTotalChars: config.files?.maxTotalChars, pdftotext: config.files?.pdftotext,
     }) : { attach: [], notes: [], rejected: [] };
     let memoryLines: string[] = [];
+    let memoryIndex = "";
     let memoryTotal = 0;
     let memorySource = "Notion 权威";
     try {
       if (notionCache && notionMemory) {
         const loaded = await notionCache.load();
+        memoryIndex = await notionMemory.indexText();
         const sel = notionMemory.select(loaded.entries, request.text, {
           maxInjectChars: config.memory?.maxInjectChars,
           minRelevanceScore: config.memory?.minRelevanceScore,
+          indexText: memoryIndex,
         });
         memoryLines = sel.lines;
         memoryTotal = sel.total;
         memorySource = loaded.label;
-        log(`[memory] ${loaded.label} 注入 ${memoryLines.length}/${memoryTotal} 条${loaded.stale ? "（stale，本轮刷新失败）" : ""}`);
+        log(`[memory] ${loaded.label} 注入 ${memoryLines.length}/${memoryTotal} 条，目录 ${sel.index.length} 字${loaded.stale ? "（stale，本轮刷新失败）" : ""}`);
       } else {
         const sel = memory.select(userId, request.text);
         memoryLines = sel.lines.map((line) => `- [archive] ${line.replace(/^- /, "")}`);
@@ -543,6 +553,7 @@ async function handleRequest(request: ConversationRequest): Promise<Conversation
     }
     const background: string[] = [];
     if (summary) background.push(`[此前对话摘要（更早内容已压缩，供参考）]\n${summary}`);
+    if (memoryIndex) background.push(`[记忆目录（索引，不是记忆条目）]\n下面是长期记忆的目录索引，只用于判断"有没有相关记忆、要不要 recall"；它不是记忆条目，不要当事实本身引用，需要原文时用 recall。\n${memoryIndex}`);
     if (memoryLines.length) background.push(`[系统背景——长期记忆，来自 ${memorySource}，active ${memoryTotal} 条；仅在相关时参考]\n${memoryLines.join("\n")}`);
     const allJobs = delegations.list();
     const relevantJobs = selectBackgroundJobs(allJobs, request.text).map(jobView);
