@@ -12,6 +12,7 @@ import { MemoryStore, type MemoryOptions } from "../src/memory.ts";
  * 2. 不 reset 时，sessionFor 仍拿到预热摘要
  * 3. reset 发生在预热尚未完成时，新会话同样拿不到这份摘要
  * 4. 没有预热、走同步兜底压缩时：压缩进行中 reset，新会话摘要为空；不 reset 仍返回摘要
+ * 5. 同步兜底成功但会话文件没写回时，下一轮不得把同一份摘要再注入一次
  */
 
 const SUMMARY = "此前在讨论发布计划，决定下周上线。";
@@ -141,6 +142,18 @@ try {
     check("同步兜底进行中 reset，本次摘要为空", session.summary === "", JSON.stringify(session.summary));
     const again = await memory.sessionFor(userId);
     check("同步兜底完成后新会话摘要仍为空", again.summary === "", JSON.stringify(again.summary));
+  }
+
+  {
+    const dir = path.join(root, "sync-once");
+    const userId = "sync-once";
+    const memory = newStore(dir, async () => SUMMARY);
+    writeHotSession(dir, userId);
+    const first = await memory.sessionFor(userId);
+    check("同步兜底首次返回摘要", first.summary === SUMMARY, JSON.stringify(first.summary));
+    check("本轮失败后会话文件仍未写回", !existsSync(path.join(dir, `user-${userId}.jsonl`)));
+    const second = await memory.sessionFor(userId);
+    check("会话文件未写回时下一轮不再注入同一份摘要", second.summary === "", JSON.stringify(second.summary));
   }
 } finally {
   rmSync(root, { recursive: true, force: true });

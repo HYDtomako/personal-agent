@@ -91,7 +91,11 @@ export class MemoryStore {
           this.consumedSummaries.add(path.basename(archive + SUMMARY_SUFFIX));
           return { file, summary: "" };
         }
-        if (summary) this.opts.log(`[memory] 窗口达阈值，已压缩（${Math.round(statSync(archive).size / 1024)}KB）`);
+        // 摘要已落盘。本轮若在写回会话文件前失败，下一轮会把它当成未消费的预热摘要再注入一次。
+        if (summary) {
+          this.consumedSummaries.add(path.basename(archive + SUMMARY_SUFFIX));
+          this.opts.log(`[memory] 窗口达阈值，已压缩（${Math.round(statSync(archive).size / 1024)}KB）`);
+        }
         return { file, summary };
       } catch (err) {
         this.opts.log("[memory] 归档/压缩失败:", err instanceof Error ? err.message : err);
