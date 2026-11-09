@@ -165,6 +165,8 @@ export class MemoryStore {
         summary = (await Promise.race([running, timeout])).trim();
       }
       if (!summary) return "";
+      // 等待预热期间可能已经开了新对话：摘要文件名已被记入已消费，这里不能再注入。
+      if (this.consumedSummaries.has(name)) return "";
 
       this.consumedSummaries.add(name);
       this.opts.log(`[memory] 注入后台预热摘要：${path.basename(latest.archive)}（${summary.length} 字符）`);
@@ -211,8 +213,21 @@ export class MemoryStore {
     return Math.round(window * ratio);
   }
 
+  /**
+   * 该用户最新一份预热摘要（含尚未落盘、仍在 prefetching 里的）记入已消费。
+   * 新对话的每条返回路径都要先走这里：否则会话文件已被预热归档时会早退，
+   * 下一轮 sessionFor 又把刚丢掉的摘要注入进来。预热还在写文件时，先占住
+   * 摘要文件名，完成后 takePrefetchedSummary 看到已消费就不再注入。
+   */
+  private consumeLatestSummary(userId: string): void {
+    const latest = this.latestArchived(userId);
+    if (!latest) return;
+    this.consumedSummaries.add(path.basename(latest.summaryFile));
+  }
+
   /** 新对话：丢弃当前会话窗口（归档而非删除），下次消息从空上下文开始。 */
   resetSession(userId: string): void {
+    this.consumeLatestSummary(userId);
     const file = path.join(this.opts.dir, `user-${userId}.jsonl`);
     this.windows.delete(userId);
     if (!existsSync(file)) return;
