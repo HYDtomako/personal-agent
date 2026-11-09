@@ -213,8 +213,175 @@ async function main() {
     assert.doesNotMatch(textOf(result), /网络错误/);
   });
 
-  await test("notion_search 网络错误重试 3 次，文案含 cause", async () => {
-    installFetch(() => {
+  // ── recall 按目录短 id 精确取回 + 附页面正文 ──
+  const PAGE_ID = "11112222-3333-4444-8555-666677778888";
+  const SHORT_ID = "778888";
+
+  function memoryPage(id, body, kind = "memory") {
+    return {
+      object: "page",
+      id,
+      properties: {
+        名称: { title: [{ plain_text: body.slice(0, 30) }] },
+        内容: { rich_text: [{ plain_text: body }] },
+        ID: { rich_text: [{ plain_text: id }] },
+        类型: { select: { name: kind } },
+        状态: { select: { name: "active" } },
+        时间: { date: { start: "2026-11-01" } },
+      },
+    };
+  }
+
+  function childrenResponse(lines) {
+    return {
+      object: "list",
+      has_more: false,
+      results: lines.map((line) => ({
+        object: "block",
+        type: "paragraph",
+        paragraph: { rich_text: [{ type: "text", plain_text: line }] },
+      })),
+    };
+  }
+
+  /** 记忆库 query + 页面子块两个接口的假实现 */
+  function installMemoryAndBlocks(pages, children) {
+    installFetch((n, args) => {
+      const url = String(args[0]);
+      if (url.includes("/children")) return children();
+      void n;
+      return jsonResponse(200, { object: "list", results: pages, has_more: false });
+    });
+  }
+
+  await test("recall 按短 id 精确取回并附页面正文", async () => {
+    installMemoryAndBlocks([memoryPage(PAGE_ID, "用户偏好深色主题")], () =>
+      jsonResponse(200, childrenResponse(["来源：pa · memory", "正文第一段：深色主题", "正文第二段：不要高亮"])),
+    );
+    const result = await memoryTools.recall.execute("1", { id: `#${SHORT_ID}` });
+    const out = textOf(result);
+    assert.equal(fetchCount, 2, "一次 query + 一次读正文");
+    assert.match(out, /用户偏好深色主题/);
+    assert.match(out, new RegExp(`#${SHORT_ID}`), "要带上短 id 便于核对");
+    assert.match(out, new RegExp(PAGE_ID), "要带上完整 pageId");
+    assert.match(out, /页面正文要点/);
+    assert.match(out, /正文第一段：深色主题\n正文第二段：不要高亮/, "正文按块顺序、块间换行");
+    assert.doesNotMatch(out, /读取失败/);
+  });
+
+  await test("recall 用完整 pageId（无连字符/大写）也能命中", async () => {
+    installMemoryAndBlocks([memoryPage(PAGE_ID, "用户偏好深色主题")], () =>
+      jsonResponse(200, childrenResponse(["正文"])),
+    );
+    const upper = PAGE_ID.replace(/-/g, "").toUpperCase();
+    const result = await memoryTools.recall.execute("1", { id: upper });
+    assert.match(textOf(result), /用户偏好深色主题/, "大小写不敏感、连字符可有可无");
+  });
+
+  await test("recall id 优先于 query", async () => {
+    installMemoryAndBlocks(
+      [memoryPage(PAGE_ID, "用户偏好深色主题"), memoryPage("99990000-1111-4222-8333-444455556666", "深色主题相关的另一条")],
+      () => jsonResponse(200, childrenResponse(["正文"])),
+    );
+    const result = await memoryTools.recall.execute("1", { id: SHORT_ID, query: "另一条" });
+    const out = textOf(result);
+    assert.match(out, /用户偏好深色主题/, "给了 id 就只返回那一条");
+    assert.doesNotMatch(out, /深色主题相关的另一条/);
+  });
+
+  await test("recall 正文读取失败只降级，不整体失败", async () => {
+    installFetch((n, args) => {
+      const url = String(args[0]);
+      if (url.includes("/children")) return jsonResponse(500, { message: "block blew up" });
+      void n;
+      return jsonResponse(200, { object: "list", results: [memoryPage(PAGE_ID, "用户偏好深色主题")], has_more: false });
+    });
+    const result = await memoryTools.recall.execute("1", { id: SHORT_ID });
+    const out = textOf(result);
+    assert.match(out, /用户偏好深色主题/, "属性列内容照常返回");
+    assert.match(out, /页面正文读取失败/);
+    assert.match(out, /block blew up/);
+    assert.doesNotMatch(out, /已降级到本地只读归档/, "不该走到归档降级");
+  });
+
+  await test("recall 正文超长截断到 1500 字", async () => {
+    const long = "啊".repeat(2000);
+    installMemoryAndBlocks([memoryPage(PAGE_ID, "用户偏好深色主题")], () =>
+      jsonResponse(200, childrenResponse([long])),
+    );
+    const out = textOf(await memoryTools.recall.execute("1", { id: SHORT_ID }));
+    assert.match(out, /正文已截断到 1500 字/);
+    assert.ok(!out.includes("啊".repeat(1501)), "截断后正文不得超过 1500 字");
+  });
+
+  await test("recall id 不存在时给提示且不读正文", async () => {
+    installMemoryAndBlocks([memoryPage(PAGE_ID, "用户偏好深色主题")], () => jsonResponse(200, childrenResponse(["正文"])));
+    const out = textOf(await memoryTools.recall.execute("1", { id: "#zzzzzz" }));
+    assert.match(out, /没有找到 id=/);
+    assert.equal(fetchCount, 2, "记忆库 query + 目录表 query，都不该读正文");
+  });
+
+  await test("recall 按目录行短 id 取回目录行原文", async () => {
+    const IDX_PAGE_ID = "413b4619-9bae-8177-892a-f4e14dd60ecd";
+    installFetch((n, args) => {
+      const url = String(args[0]);
+      if (url.includes("/children")) return jsonResponse(200, childrenResponse(["coding 全派 CA", "浏览器用 ego lite"]));
+      if (url.includes("413b4619-9bae-80ee-bde0-000bb0ba7fb0")) {
+        return jsonResponse(200, {
+          object: "list",
+          has_more: false,
+          results: [
+            {
+              object: "page",
+              id: IDX_PAGE_ID,
+              properties: {
+                名称: { title: [{ plain_text: "memory 20" }] },
+                分组: { select: { name: "memory" } },
+                内容: { rich_text: [{ plain_text: "20 条事实与配置，逐条见页面正文" }] },
+                关键词: { rich_text: [{ plain_text: "coding,委派" }] },
+              },
+            },
+          ],
+        });
+      }
+      void n;
+      return jsonResponse(200, { object: "list", results: [memoryPage(PAGE_ID, "用户偏好深色主题")], has_more: false });
+    });
+    const out = textOf(await memoryTools.recall.execute("1", { id: "#d60ecd" }));
+    assert.match(out, /这是记忆目录的一行/);
+    assert.match(out, /\[memory\] memory 20/);
+    assert.match(out, /20 条事实与配置，逐条见页面正文/);
+    assert.match(out, /#d60ecd/);
+    assert.match(out, /页面正文要点/);
+    assert.match(out, /coding 全派 CA/, "目录行正文按块顺序取到");
+  });
+
+  await test("recall query 精确命中 ≤3 条时也附正文", async () => {
+    installMemoryAndBlocks(
+      [
+        memoryPage(PAGE_ID, "用户偏好深色主题"),
+        memoryPage("99990000-1111-4222-8333-444455556666", "另一条：深色主题的例外"),
+      ],
+      () => jsonResponse(200, childrenResponse(["正文要点"])),
+    );
+    const out = textOf(await memoryTools.recall.execute("1", { query: "深色主题" }));
+    assert.match(out, /命中 2 条/);
+    assert.equal((out.match(/页面正文要点/g) ?? []).length, 2, "两条命中的都要带正文");
+    assert.equal(fetchCount, 3, "一次 query + 两条各读一次正文");
+  });
+
+  await test("recall query 精确命中 >3 条时不附正文", async () => {
+    const many = [1, 2, 3, 4].map((i) =>
+      memoryPage(`${i}1112222-3333-4444-8555-666677778888`, `深色主题第 ${i} 条`),
+    );
+    installMemoryAndBlocks(many, () => jsonResponse(200, childrenResponse(["正文要点"])));
+    const out = textOf(await memoryTools.recall.execute("1", { query: "深色主题" }));
+    assert.match(out, /命中 4 条/);
+    assert.doesNotMatch(out, /页面正文要点/);
+    assert.equal(fetchCount, 1, "超过 3 条就只查属性列");
+  });
+
+  await test("notion_search 网络错误重试 3 次，文案含 cause", async () => {    installFetch(() => {
       throw fetchFailed();
     });
     await assert.rejects(

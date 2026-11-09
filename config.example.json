@@ -51,6 +51,7 @@
   },
   "notion": {
     "dataSourceId": "Notion Memory 数据库的 data source id（2025-09-03 API）",
+    "indexDataSourceId": "「记忆目录」索引表的 data source id；留空/不填就用内置的默认表",
     "databaseId": "Notion Memory 数据库 id（新建记忆页面用）",
     "timeoutMs": 3500,
     "connectTimeoutMs": 3000

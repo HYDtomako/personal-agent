@@ -40,6 +40,8 @@ const MEM_DIR = path.join(ROOT_DIR, "memory", "long-term");
 /** 主进程的 Notion 记忆缓存目录（见 src/notion-memory.ts 的 NotionMemoryCache） */
 const CACHE_DIR = path.join(ROOT_DIR, "data");
 const CACHE_DIRTY_FILE = path.join(CACHE_DIR, "notion-memory-cache.dirty");
+/** 「记忆目录」索引缓存标记：主进程看到它的 mtime 变化就丢掉目录缓存重新拉 */
+const INDEX_DIRTY_FILE = path.join(CACHE_DIR, "notion-memory-index.dirty");
 
 const TOKEN = (process.env.NOTION_TOKEN ?? "").trim();
 const DATA_SOURCE_ID = (process.env.NOTION_MEMORY_DS ?? "").trim();
@@ -50,6 +52,25 @@ const TIMEOUT_MS = 15_000;
 const MAX_TEXT_LEN = 400;
 const SIMILAR_THRESHOLD = 0.7;
 const MAX_LIST_LINES = 100;
+/**
+ * 索引表（记忆目录）的列名与写法：和 src/notion-memory.ts 的 indexRowLine 同格式。
+ * 标题列：新表叫「名称」，旧内联表叫「清单」，按顺序取第一个存在的（区分大小写）。
+ */
+const INDEX_TITLE_PROPS = ["名称", "清单"] as const;
+const INDEX_GROUP_PROP = "分组";
+const INDEX_CONTENT_PROP = "内容";
+const INDEX_KEYWORDS_PROP = "关键词";
+/** 关键词拼接用的分隔符：与索引表现有写法一致 */
+const KEYWORD_SEPARATOR = "｜";
+/** 分类 → 目录行里那句中文说法（行内已有说法时以行内为准，不覆盖人手写的文案）。 */
+const KIND_LABELS: Record<Kind, string> = {
+  memory: "事实与配置",
+  taste: "怎么答、怎么做",
+  project: "项目状态",
+  profile: "每轮必带的架构规则",
+  context: "短期上下文",
+};
+
 const KINDS = ["memory", "taste", "project", "profile", "context"] as const;
 type Kind = (typeof KINDS)[number];
 
@@ -83,21 +104,37 @@ function configured(): string | undefined {
   return undefined;
 }
 
+/** 本扩展没有 pi 的日志通道：诊断写 stderr，不碰 stdout（那是 pi 的协议流）。 */
+function logLine(message: string): void {
+  try {
+    process.stderr.write(`[memory-tools] ${message}\n`);
+  } catch {
+    /* 日志失败不影响记忆 */
+  }
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
- * 写入成功后给主进程留标记：下一轮无视 TTL 重新拉一次 Notion。
+ * 写入成功后给主进程留标记：下一轮无视 TTL 重新拉一次 Notion，并清空
+ * 「记忆目录」索引缓存（remember / forget 成功都走这里）。
  * 本扩展跑在 pi 子进程里、主服务是另一个进程，只能靠文件通信；
  * 标记只是优化，写失败不影响记忆本身。
  */
 function markCacheDirty(): void {
+  touchDirtyFile(CACHE_DIRTY_FILE);
+  touchDirtyFile(INDEX_DIRTY_FILE);
+}
+
+/** touch 一个标记文件：失败只忽略（最坏情况是缓存多留一个 TTL）。 */
+function touchDirtyFile(file: string): void {
   try {
     mkdirSync(CACHE_DIR, { recursive: true });
-    writeFileSync(CACHE_DIRTY_FILE, new Date().toISOString(), "utf8");
+    writeFileSync(file, new Date().toISOString(), "utf8");
   } catch {
-    /* 标记失败忽略：最坏情况是缓存多留一个 TTL */
+    /* 标记失败忽略 */
   }
 }
 
@@ -556,6 +593,262 @@ function formatEntries(entries: Entry[], total: number, label: string, query: st
   return `${label}（共 ${total} 条 ${totalLabel}；命中 ${entries.length} 条）：\n${lines.join("\n")}${more}`;
 }
 
+/** 页面正文最多带多少字（目录短 id → recall 时用，避免把整页塞进上下文） */
+const MAX_BODY_CHARS = 1500;
+/** query 命中的条目不超过这个数才附页面正文 */
+const MAX_BODY_ENTRIES = 3;
+
+/** 与 src/notion-memory.ts 的 shortPageId 一致：去连字符后末 6 位小写。 */
+function shortIdOf(pageId: string): string {
+  const hex = String(pageId ?? "").replace(/-/g, "").toLowerCase();
+  return hex.length >= 6 ? hex.slice(-6) : "";
+}
+
+/** 目录行末尾的短 id（可带 #）或完整 pageId → 命中的条目；不区分大小写。 */
+function findById(entries: Entry[], raw: string): Entry | undefined {
+  const cleaned = normalizeId(raw);
+  if (cleaned.length < 6) return undefined;
+  return entries.find((e) => String(e.pageId ?? "").replace(/-/g, "").toLowerCase().endsWith(cleaned));
+}
+
+function normalizeId(raw: string): string {
+  return raw.replace(/^#/, "").replace(/\s+/g, "").replace(/-/g, "").toLowerCase();
+}
+
+/**
+ * 「记忆目录」索引表的 data source id（与 src/notion-memory.ts 的 DEFAULT_INDEX_DATA_SOURCE_ID 一致）。
+ * 目录行本身不是记忆条目：按目录短 id 取原文时要单独查这张表，所以这里保留一份默认值。
+ */
+const INDEX_DATA_SOURCE_ID = (process.env.NOTION_INDEX_DS ?? "").trim() || "413b4619-9bae-80ee-bde0-000bb0ba7fb0";
+
+interface IndexRow {
+  pageId: string;
+  /** 这一行实际的标题列名：「名称」或旧内联表的「清单」 */
+  titleProp: string;
+  title: string;
+  group: string;
+  content: string;
+  keywords: string;
+}
+
+/** 索引表的一行：标题列「名称」优先，回退旧内联表的「清单」。 */
+function toIndexRow(row: { id: string; properties?: Record<string, unknown> }): IndexRow | undefined {
+  const props = row.properties ?? {};
+  const titleProp = INDEX_TITLE_PROPS.find((name) => props[name] !== undefined) ?? INDEX_TITLE_PROPS[0];
+  const title = INDEX_TITLE_PROPS.map((name) => textProp(props[name]).trim()).find(Boolean) ?? "";
+  const content = textProp(props[INDEX_CONTENT_PROP]).trim();
+  if (!title && !content) return undefined;
+  return {
+    pageId: row.id,
+    titleProp,
+    title,
+    group: selectProp(props[INDEX_GROUP_PROP]).trim(),
+    content,
+    keywords: textProp(props[INDEX_KEYWORDS_PROP]).trim(),
+  };
+}
+
+/** 按短 id / 完整 pageId 在记忆目录里找一行；查不到返回 undefined，不抛错。 */
+async function findIndexRowById(raw: string): Promise<IndexRow | undefined> {
+  const cleaned = normalizeId(raw);
+  if (cleaned.length < 6) return undefined;
+  let cursor: string | undefined;
+  try {
+    do {
+      const page = await call<{ results?: Array<{ id: string; properties?: Record<string, unknown> }>; has_more?: boolean; next_cursor?: string }>(
+        "POST",
+        `/data_sources/${INDEX_DATA_SOURCE_ID}/query`,
+        { page_size: 100, ...(cursor ? { start_cursor: cursor } : {}) },
+      );
+      for (const row of page.results ?? []) {
+        if (!String(row.id ?? "").replace(/-/g, "").toLowerCase().endsWith(cleaned)) continue;
+        const found = toIndexRow(row);
+        if (found) return found;
+      }
+      cursor = page.has_more ? page.next_cursor : undefined;
+    } while (cursor);
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+/** 某一分类的 active 条数与关键词（关键词已去重、按出现顺序、用「｜」连接）。 */
+export interface KindSummary {
+  kind: Kind;
+  count: number;
+  keywords: string;
+}
+
+/**
+ * 统计各分类 active 条数与关键词。
+ * 关键词：把所有 active 条目的 Keywords 按「｜/,/，/、」拆开、去重，按条数与出现顺序拼回去。
+ * 条数为 0 的分类不进结果：调用方据此跳过，不把行清空。
+ */
+export function summarizeByKind(entries: Entry[]): KindSummary[] {
+  const buckets = new Map<Kind, Entry[]>();
+  for (const kind of KINDS) buckets.set(kind, []);
+  for (const entry of entries) {
+    if (entry.status === "archived") continue;
+    buckets.get(entry.kind)?.push(entry);
+  }
+  const out: KindSummary[] = [];
+  for (const kind of KINDS) {
+    const list = buckets.get(kind) ?? [];
+    if (list.length === 0) continue;
+    const seen = new Set<string>();
+    const words: string[] = [];
+    for (const entry of list) {
+      for (const raw of (entry.keywords ?? "").split(/[｜,，、]/)) {
+        const word = raw.trim();
+        if (!word || seen.has(word)) continue;
+        seen.add(word);
+        words.push(word);
+      }
+    }
+    out.push({ kind, count: list.length, keywords: words.join(KEYWORD_SEPARATOR) });
+  }
+  return out;
+}
+
+/**
+ * 行内已有的说法：`memory 20 · 事实与配置` → `事实与配置`。
+ * 取不到（没有 `·`、或 `·` 后只是数字）就用内置的中文说法，绝不把标题改成没有说法的样子。
+ */
+function labelOf(title: string, kind: Kind): string {
+  const tail = /·\s*(.+)$/.exec(title)?.[1]?.trim() ?? "";
+  if (tail && !/^\d+$/.test(tail)) return tail;
+  return KIND_LABELS[kind];
+}
+
+export interface IndexRowText {
+  title: string;
+  content: string;
+  keywords: string;
+}
+
+/**
+ * 按分类重算目录行文本（与索引表现有格式一致）：
+ *   名称：`memory 21 · 事实与配置`（`·` 后的说法沿用行内现有说法）
+ *   内容：`21 条事实与配置，逐条见页面正文`（只换开头的条数，该列自己的说法/说明原样保留）
+ *   关键词：`coding｜委派｜…`
+ */
+export function buildIndexRowText(
+  kind: Kind,
+  summary: { count: number; keywords: string },
+  current: { title: string; content: string },
+): IndexRowText {
+  const label = labelOf(current.title, kind);
+  const counted = /^(\d+)\s*条([^，,]*)([，,][\s\S]*)?$/.exec(current.content);
+  let content: string;
+  if (counted) content = `${summary.count} 条${counted[2]}${counted[3] ?? ""}`;
+  else content = current.content.trim() || `${summary.count} 条${label}`;
+  return {
+    title: `${kind} ${summary.count} · ${label}`,
+    content,
+    keywords: summary.keywords,
+  };
+}
+
+/** 按「分组」属性精确匹配索引表里的行（返回全部匹配，让调用方判断是否唯一）。 */
+async function findIndexRowsByGroup(group: string): Promise<IndexRow[]> {
+  const out: IndexRow[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await call<{ results?: Array<{ id: string; properties?: Record<string, unknown> }>; has_more?: boolean; next_cursor?: string }>(
+      "POST",
+      `/data_sources/${INDEX_DATA_SOURCE_ID}/query`,
+      { page_size: 100, ...(cursor ? { start_cursor: cursor } : {}) },
+    );
+    for (const row of page.results ?? []) {
+      const parsed = toIndexRow(row);
+      if (parsed && parsed.group === group) out.push(parsed);
+    }
+    cursor = page.has_more ? page.next_cursor : undefined;
+  } while (cursor);
+  return out;
+}
+
+/**
+ * 把「记忆目录」里该分类那一行重算成真实条数/关键词，变了才 PATCH。
+ *
+ * 定位只认「分组」精确匹配且恰好一行；匹配不到（或多行）只 log，绝不新建行、绝不改别的行。
+ * 0 条的分类跳过不写（不把行清空）；文本没变就不 PATCH（幂等）。
+ */
+export async function syncIndexRow(kind: Kind): Promise<"skipped" | "unchanged" | "patched"> {
+  const summary = summarizeByKind(await listActive()).find((item) => item.kind === kind);
+  if (!summary) {
+    logLine(`记忆目录行同步跳过：${kind} 当前 0 条 active（不清空行）`);
+    return "skipped";
+  }
+  const rows = await findIndexRowsByGroup(kind);
+  if (rows.length !== 1) {
+    logLine(`记忆目录行同步跳过：按「${INDEX_GROUP_PROP}」精确匹配 ${kind} 得到 ${rows.length} 行（要求恰好 1 行），不新建也不改别的行`);
+    return "skipped";
+  }
+  const row = rows[0];
+  const next = buildIndexRowText(kind, summary, row);
+  if (next.title === row.title && next.content === row.content && next.keywords === row.keywords) {
+    logLine(`记忆目录行同步：${kind} 未变化（${summary.count} 条），不写入`);
+    return "unchanged";
+  }
+  // 原值先落日志：要回滚就把这三段贴回索引表那一行。
+  logLine(
+    `记忆目录行同步：${kind} 即将更新 pageId=${row.pageId}（原值，回滚用）` +
+      `${row.titleProp}=「${row.title}」${INDEX_CONTENT_PROP}=「${row.content}」${INDEX_KEYWORDS_PROP}=「${row.keywords}」`,
+  );
+  await call("PATCH", `/pages/${row.pageId}`, {
+    properties: {
+      [row.titleProp]: { title: [{ type: "text", text: { content: next.title } }] },
+      [INDEX_CONTENT_PROP]: { rich_text: [{ type: "text", text: { content: next.content } }] },
+      [INDEX_KEYWORDS_PROP]: { rich_text: [{ type: "text", text: { content: next.keywords } }] },
+    },
+  });
+  logLine(
+    `记忆目录行同步：${kind} 已更新（${summary.count} 条）${row.titleProp}=「${next.title}」` +
+      `${INDEX_CONTENT_PROP}=「${next.content}」${INDEX_KEYWORDS_PROP}=「${next.keywords}」`,
+  );
+  // 主进程缓存里还是旧目录：touch 一下让它下一轮重拉。
+  touchDirtyFile(INDEX_DIRTY_FILE);
+  return "patched";
+}
+
+/** remember / forget 成功后调用：不阻塞返回，失败只 log，不影响记忆写入本身。 */
+function scheduleIndexSync(kind: Kind): void {
+  void syncIndexRow(kind).catch((error) => {
+    logLine(`记忆目录行同步失败（${describeError(error)}；记忆本身已写入）`);
+  });
+}
+
+/** 读页面正文（GET /blocks/{pageId}/children）：按块顺序取 rich_text plain_text，块间换行。 */
+async function pageBodyText(pageId: string): Promise<string> {
+  const res = await call<{ results?: Array<Record<string, unknown>> }>(
+    "GET",
+    `/blocks/${pageId}/children?page_size=100`,
+  );
+  const parts: string[] = [];
+  for (const block of res.results ?? []) {
+    const type = typeof block?.type === "string" ? block.type : "";
+    if (!type) continue;
+    const payload = block[type] as { rich_text?: unknown } | undefined;
+    const line = plain(payload?.rich_text).trim();
+    if (line) parts.push(line);
+  }
+  const body = parts.join("\n").trim();
+  if (!body) return "";
+  return body.length > MAX_BODY_CHARS ? `${body.slice(0, MAX_BODY_CHARS)}…（正文已截断到 ${MAX_BODY_CHARS} 字）` : body;
+}
+
+/** 正文段落：读失败只降级成一句提示，不让 recall 整体失败。 */
+async function bodySection(pageId: string): Promise<string> {
+  try {
+    const body = await pageBodyText(pageId);
+    return body ? `页面正文要点：\n${body}` : "页面正文为空（属性列已含内容）。";
+  } catch (error) {
+    return `页面正文读取失败（${error instanceof Error ? error.message : error}），只返回属性列内容。`;
+  }
+}
+
 const SCHEMA_REMEMBER = {
   type: "object",
   properties: {
@@ -588,6 +881,11 @@ const SCHEMA_REMEMBER = {
 const SCHEMA_RECALL = {
   type: "object",
   properties: {
+    id: {
+      type: "string",
+      description:
+        "可选：记忆目录行末尾的短 id（如 #3fa1b2）或完整 pageId；给了就直接取回那一条的属性和页面正文，优先于 query",
+    },
     query: { type: "string", description: "可选：检索关键词，不填则列出全部" },
     kind: { type: "string", enum: KINDS, description: "可选：只查某一类" },
     source: {
@@ -667,6 +965,7 @@ export default function memoryToolsExtension(pi: ExtensionAPI) {
           bodyBlocks({ text: raw, id: target.id, t: now, ...(basis ? { basis } : {}) }, kind),
         );
         markCacheDirty();
+        scheduleIndexSync(kind);
         return text(`已合并到原有条目（${kind}，id=${target.id}）：\n旧：${target.text}\n新：${raw}`);
       }
 
@@ -676,6 +975,7 @@ export default function memoryToolsExtension(pi: ExtensionAPI) {
         const basis = target.id || target.pageId;
         const id = await createEntry(raw, kind, basis, keywords || undefined);
         markCacheDirty();
+        scheduleIndexSync(kind);
         return text(`已新建并关联（${kind}，id=${id}）→ [${target.kind}] ${basis}：${raw}`);
       }
 
@@ -709,6 +1009,7 @@ export default function memoryToolsExtension(pi: ExtensionAPI) {
               bodyBlocks({ text: raw, id: best.e.id, t: now, ...(basis ? { basis } : {}) }, kind),
             );
             markCacheDirty();
+            scheduleIndexSync(kind);
             return text(`已更新原有 Notion 记忆条目（${kind}，id=${best.e.id}）：\n旧：${best.e.text}\n新：${raw}`);
           }
           return text(crossTypeHint(best.e, best.s));
@@ -717,6 +1018,7 @@ export default function memoryToolsExtension(pi: ExtensionAPI) {
 
       const id = await createEntry(raw, kind, undefined, keywords || undefined);
       markCacheDirty();
+      scheduleIndexSync(kind);
       return text(`已写入 Notion（${kind}，id=${id}）：${raw}`);
     },
   });
@@ -724,16 +1026,18 @@ export default function memoryToolsExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "recall",
     label: "Recall",
-    description: "查询 Notion 长期记忆库（默认列出全部，可按关键词/类型检索）；必要时可读本地只读归档。",
+    description: "查询 Notion 长期记忆库（默认列出全部，可按关键词/类型检索，也可按目录行末尾的短 id 精确取回并带页面正文）；必要时可读本地只读归档。",
     promptSnippet: "recall: search Notion long-term memory",
     promptGuidelines: [
       "胡同学问\"你记得我什么\"\"我让你记过什么\"时调用；需要确认某个久远事实时也可以主动查。",
+      "注入到对话里的记忆目录每行末尾有 #短id；要某一条的原文时，用 id:\"#xxxxxx\" 精确取回（比 query 更准，会附页面正文）。",
       "默认查 Notion；注入到对话里的只是相关的一部分，怀疑有没显示的条目时先用它检索，不要直接说\"不记得\"。",
       "只有 Notion 里找不到、且胡同学问的是 2026-10-22 之前的旧事时，才传 source=archive 查本地归档。",
     ],
     parameters: SCHEMA_RECALL,
     async execute(_id, params) {
       const query = String(params.query ?? "").trim();
+      const rawId = String(params.id ?? "").trim();
       const kind = KINDS.includes(params.kind as Kind) ? (params.kind as Kind) : undefined;
       const source = String(params.source ?? "notion");
       if (source === "archive") {
@@ -748,6 +1052,29 @@ export default function memoryToolsExtension(pi: ExtensionAPI) {
         return text(`${problem}\n已降级到本地只读归档。\n${formatEntries(entries, total, "本地只读归档（2026-10-22 前）", query, "归档")}`);
       }
       try {
+        // id 优先于 query：目录行末尾的短 id / 完整 pageId 直接取回这一条 + 页面正文。
+        if (rawId) {
+          const all = await listActive();
+          const hit = findById(kind ? all.filter((e) => e.kind === kind) : all, rawId);
+          if (hit) {
+            const head = formatEntries([hit], all.length, "Notion 长期记忆", rawId);
+            return text(`${head}\npageId：${hit.pageId}（短 id #${shortIdOf(hit.pageId)}）\n${await bodySection(hit.pageId)}`);
+          }
+          // 记忆条目里没有：目录行本身是索引表的一行（一条 = 一组），按同一个短 id 去索引表取原文。
+          const row = await findIndexRowById(rawId);
+          if (row) {
+            const meta = [
+              `[${row.group || "目录"}] ${row.title || "(无标题)"}`,
+              row.content ? `内容：${row.content}` : "",
+              row.keywords ? `关键词：${row.keywords}` : "",
+              `pageId：${row.pageId}（短 id #${shortIdOf(row.pageId)}）`,
+            ].filter(Boolean);
+            return text(
+              `这是记忆目录的一行（不是单条记忆，正文里列出该组条目）：\n${meta.join("\n")}\n${await bodySection(row.pageId)}`,
+            );
+          }
+          return text(`没有找到 id=${rawId} 的记忆条目或目录行（记忆库 active ${all.length} 条）。可以不带 id 再 recall 一次。`);
+        }
         const entries = await listActive(kind);
         if (!query) {
           const sorted = [...entries].sort((a, b) => (b.date ?? "").localeCompare(a.date ?? ""));
@@ -757,7 +1084,14 @@ export default function memoryToolsExtension(pi: ExtensionAPI) {
         const exact = query.length >= 2 ? entries.filter((e) => e.text.includes(query) || (e.keywords ?? "").includes(query)) : [];
         if (exact.length > 0) {
           const sorted = exact.sort((a, b) => (b.date ?? "").localeCompare(a.date ?? ""));
-          return text(formatEntries(sorted, entries.length, "Notion 长期记忆", query));
+          const head = formatEntries(sorted, entries.length, "Notion 长期记忆", query);
+          // 精确命中的条目本来就少：各自附上页面正文，让 recall 返回原文而不是只剩摘要。
+          if (sorted.length > MAX_BODY_ENTRIES) return text(head);
+          const bodies: string[] = [];
+          for (const entry of sorted) {
+            bodies.push(`— ${entry.id}（#${shortIdOf(entry.pageId)} · ${entry.pageId}）\n${await bodySection(entry.pageId)}`);
+          }
+          return text(`${head}\n\n${bodies.join("\n\n")}`);
         }
         const scores = rankByQuery(
           query,
@@ -825,6 +1159,8 @@ export default function memoryToolsExtension(pi: ExtensionAPI) {
         });
       }
       markCacheDirty();
+      // 归档可能跨多个分类：每个受影响的分类各同步一次自己的目录行。
+      for (const kind of new Set(hit.map((e) => e.kind))) scheduleIndexSync(kind);
       return text(`已归档 ${hit.length} 条（页面保留，可恢复）：\n${hit.map((e) => `- [${e.kind}] ${e.text}`).join("\n")}`);
     },
   });

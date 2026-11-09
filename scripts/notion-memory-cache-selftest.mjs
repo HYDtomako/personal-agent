@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createServer } from "node:http";
-import { NotionMemory, NotionMemoryCache } from "../src/notion-memory.ts";
+import { DEFAULT_INDEX_DATA_SOURCE_ID, NotionMemory, NotionMemoryCache } from "../src/notion-memory.ts";
 import { MemoryStore } from "../src/memory.ts";
 
 /**
@@ -65,39 +65,78 @@ function listOf(...pages) {
   return { object: "list", results: pages, has_more: false, next_cursor: null };
 }
 
+/** 索引表的一行（data source query 的 results 元素）；titleProp 默认新表的「名称」 */
+function indexRow({ group, title, content, keywords, titleProp = "名称", id = "0a1b2c3d-4e5f-6789-abcd-ef0123450000" }) {
+  const richText = (text) => (text === undefined ? [] : [{ type: "text", plain_text: text }]);
+  return {
+    object: "page",
+    id,
+    properties: {
+      [titleProp]: { type: "title", title: richText(title) },
+      分组: { type: "select", select: group === undefined ? null : { name: group } },
+      内容: { type: "rich_text", rich_text: richText(content) },
+      关键词: { type: "rich_text", rich_text: richText(keywords) },
+    },
+  };
+}
+
+function indexListOf(rows, nextCursor = null) {
+  return { object: "list", results: rows, has_more: Boolean(nextCursor), next_cursor: nextCursor };
+}
+
+/** 目录行末尾的短 id：page id 去连字符后末 6 位小写（与 src/notion-memory.ts 的 shortPageId 同规则）。 */
+function withShortId(line, pageId) {
+  return `${line} · #${pageId.replace(/-/g, "").slice(-6)}`;
+}
+
 /**
  * 假 Notion：behavior(第几次请求) 决定本次行为。
  *   "ok"     → 200 + payload()
  *   "reset"  → 直接销毁 socket（模拟连接被重置）
+ *   "hang"   → 永不响应
  *   "429"    → 429 限流
  *   数字     → 该 HTTP 状态码
+ * 请求体也会被收集（state.methods / state.bodies），用于断言 data source query 的 body。
  */
 async function fakeNotion(behavior, payload = () => listOf(entryPage("mem-1", "用户偏好深色主题"))) {
-  const state = { requests: 0, paths: [] };
+  const state = { requests: 0, paths: [], methods: [], bodies: [] };
   const server = createServer((req, res) => {
-    req.resume();
     state.requests++;
     state.paths.push(req.url);
-    const action = behavior(state.requests);
-    if (action === "reset") {
-      req.socket.destroy();
-      return;
-    }
-    if (action === "hang") {
-      return; // 永不响应：等客户端自己的超时把它掐掉
-    }
-    if (action === "429") {
-      res.writeHead(429, { "content-type": "application/json" });
-      res.end(JSON.stringify({ message: "rate limited" }));
-      return;
-    }
-    if (typeof action === "number") {
-      res.writeHead(action, { "content-type": "application/json" });
-      res.end(JSON.stringify({ message: `http ${action}` }));
-      return;
-    }
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify(payload(state.requests)));
+    state.methods.push(req.method);
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("error", () => {});
+    req.on("end", () => {
+      const raw = Buffer.concat(chunks).toString("utf8");
+      let body;
+      try {
+        body = raw ? JSON.parse(raw) : undefined;
+      } catch {
+        body = raw;
+      }
+      state.bodies.push(body);
+      const action = behavior(state.requests);
+      if (action === "reset") {
+        req.socket.destroy();
+        return;
+      }
+      if (action === "hang") {
+        return; // 永不响应：等客户端自己的超时把它掐掉
+      }
+      if (action === "429") {
+        res.writeHead(429, { "content-type": "application/json" });
+        res.end(JSON.stringify({ message: "rate limited" }));
+        return;
+      }
+      if (typeof action === "number") {
+        res.writeHead(action, { "content-type": "application/json" });
+        res.end(JSON.stringify({ message: `http ${action}` }));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(payload(state.requests, state)));
+    });
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   state.baseUrl = `http://127.0.0.1:${server.address().port}`;
@@ -273,6 +312,138 @@ async function main() {
     } finally {
       memory.close();
       await server.close();
+    }
+  });
+
+  await test("记忆目录改读索引表（data source query）：翻页、拼行、缓存、失败降级", async () => {
+    clock = new Date("2026-11-01T10:00:00").getTime();
+    const files = paths("index");
+    const indexDataSourceId = "idx-ds-selftest";
+    const page1 = [
+      indexRow({ group: "说明", title: "总览", content: "记忆目录的读法与写入时机", keywords: "索引、recall", id: "413b4619-9bae-80ee-bde0-000bb0baa1b2" }),
+      indexRow({ group: "profile", title: "profile · 2", content: "2 条稳定画像", keywords: "身份、沟通偏好", id: "1f2e3d4c-5b6a-4798-8654-33221100c3d4" }),
+      indexRow({ group: "taste", title: "taste · 18", content: "18 条口味偏好", keywords: "审美、口味", id: "aa11bb22-cc33-4d44-8e55-ff66aa77e5f6" }),
+    ];
+    const page2 = [
+      indexRow({ group: "project", title: "project · 5", content: "5 条项目约定", keywords: "工程约定", id: "0f9e8d7c-6b5a-4433-8211-0099887707a8" }),
+      indexRow({ group: "memory", title: "memory · 20", content: "20 条长期记忆", keywords: "事实、结论", id: "12345678-90ab-4cde-8f01-23456789b9c0" }),
+      // 向后兼容：旧内联表的标题列叫「清单」→ 取不到「名称」时回退
+      indexRow({ group: "memory", title: "旧表行", content: "标题列是清单", titleProp: "清单", id: "deadbeef-1111-4222-8333-4444555566c1" }),
+      // 两列都在时「名称」优先
+      {
+        object: "page",
+        id: "cafebabe-2222-4333-8444-5555666677d2",
+        properties: {
+          名称: { type: "title", title: [{ plain_text: "名称优先" }] },
+          清单: { type: "title", title: [{ plain_text: "清单靠后" }] },
+          分组: { type: "select", select: { name: "memory" } },
+          内容: { type: "rich_text", rich_text: [{ plain_text: "两列都有" }] },
+        },
+      },
+      // 边界行：缺「分组」→ 不带 [分组] 前缀；缺「名称/关键词」→ 不留多余分隔符
+      indexRow({ title: "无分组的行", content: "只有标题和内容", id: "01234567-89ab-4cde-8f01-23456789e3e4" }),
+      indexRow({ group: "说明", content: "只有分组和内容", id: "76543210-fedc-4ba9-8765-432109870f5a" }),
+      // 边界行：拿不到 page id（id 缺失/不是字符串）→ 不加短 id 后缀，也不抛错
+      {
+        object: "page",
+        properties: {
+          名称: { type: "title", title: [{ plain_text: "没有页面 id" }] },
+          分组: { type: "select", select: { name: "说明" } },
+          内容: { type: "rich_text", rich_text: [{ plain_text: "解析不到 id" }] },
+        },
+      },
+      // 边界行：类型不符（内容不是 rich_text、关键词不是数组）→ 两个字段都跳过、整行跳过
+      { object: "page", id: "bad0bad0-bad0-4bad-8bad-bad0bad0bad0", properties: { 名称: { title: [] }, 分组: { select: null }, 内容: { number: 1 }, 关键词: "not-an-array" } },
+    ];
+    const expected = [
+      withShortId("[说明] 总览 · 记忆目录的读法与写入时机 · 索引、recall", "413b4619-9bae-80ee-bde0-000bb0baa1b2"),
+      withShortId("[profile] profile · 2 · 2 条稳定画像 · 身份、沟通偏好", "1f2e3d4c-5b6a-4798-8654-33221100c3d4"),
+      withShortId("[taste] taste · 18 · 18 条口味偏好 · 审美、口味", "aa11bb22-cc33-4d44-8e55-ff66aa77e5f6"),
+      withShortId("[project] project · 5 · 5 条项目约定 · 工程约定", "0f9e8d7c-6b5a-4433-8211-0099887707a8"),
+      withShortId("[memory] memory · 20 · 20 条长期记忆 · 事实、结论", "12345678-90ab-4cde-8f01-23456789b9c0"),
+      withShortId("[memory] 旧表行 · 标题列是清单", "deadbeef-1111-4222-8333-4444555566c1"),
+      withShortId("[memory] 名称优先 · 两列都有", "cafebabe-2222-4333-8444-5555666677d2"),
+      withShortId("无分组的行 · 只有标题和内容", "01234567-89ab-4cde-8f01-23456789e3e4"),
+      withShortId("[说明] 只有分组和内容", "76543210-fedc-4ba9-8765-432109870f5a"),
+      "[说明] 没有页面 id · 解析不到 id",
+    ].join("\n");
+    const server = await fakeNotion(
+      () => "ok",
+      (n, state) => (state.bodies.at(-1)?.start_cursor ? indexListOf(page2) : indexListOf(page1, "cursor-page-2")),
+    );
+    const indexDirtyFile = path.join(files.dir, "notion-memory-index.dirty");
+    const memory = newMemory(server.baseUrl, {
+      indexDataSourceId,
+      indexDirtyFile,
+      indexTtlMs: 300_000,
+    });
+    try {
+      const first = await memory.indexText();
+      assert.equal(first, expected, "每行 `[分组] 标题 · 内容 · 关键词 · #短id`，空字段跳过，行序按返回顺序");
+      // 短 id 存在性：有 page id 的行都以 ` · #xxxxxx`（6 位小写）结尾；拿不到 id 的行不加后缀
+      const dirLines = first.split("\n");
+      assert.equal(dirLines.length, 10, "10 行（9 行有 page id + 1 行没有）");
+      for (const line of dirLines.slice(0, 9)) {
+        assert.match(line, / · #[0-9a-z]{6}$/, `目录行应以 6 位短 id 结尾：${line}`);
+      }
+      assert.doesNotMatch(dirLines[9], /#[0-9a-z]{6}$/, `拿不到 page id 时不得加短 id：${dirLines[9]}`);
+      assert.equal(new Set(dirLines.slice(0, 9).map((line) => line.split("#").at(-1))).size, 9, "不同 page id 的短 id 不应重复");
+      assert.equal(server.requests, 2, "has_more=true 应继续翻页");
+      assert.deepEqual(server.methods, ["POST", "POST"], "索引表走 data source query（POST）");
+      assert.deepEqual(
+        server.paths,
+        [`/v1/data_sources/${indexDataSourceId}/query`, `/v1/data_sources/${indexDataSourceId}/query`],
+        "不再读页面子块",
+      );
+      assert.deepEqual(server.bodies[0], { page_size: 100 }, "首页请求体只有 page_size");
+      assert.deepEqual(server.bodies[1], { page_size: 100, start_cursor: "cursor-page-2" }, "翻页带 start_cursor");
+
+      assert.equal(await memory.indexText(), first);
+      assert.equal(server.requests, 2, "索引缓存 TTL 内不得再发请求");
+
+      // 目录单独返回：不参与打分，也不占记忆的字符预算
+      const profiles = [
+        { pageId: "p1", id: "mem-1", text: "架构规则：每轮都要在场".repeat(5), kind: "profile", status: "active", source: "pa", scope: "system" },
+      ];
+      const sel = memory.select(profiles, "深色主题", { maxInjectChars: 10, indexText: first });
+      assert.equal(sel.index, first, "目录要原样作为独立字段 index 返回");
+      assert.ok(sel.index.length > 10, "目录长度已超过记忆字数上限");
+      assert.equal(sel.lines.length, 0, "目录不得挤占记忆条目预算");
+
+      // 写入路径 touch 标记 → 下次读取重新拉取
+      fs.writeFileSync(indexDirtyFile, new Date(clock).toISOString(), "utf8");
+      assert.equal(await memory.indexText(), first, "清缓存后重拉，同一份数据拼行应一致");
+      assert.equal(server.requests, 4, "写入标记应清空索引缓存并重新翻完两页");
+    } finally {
+      memory.close();
+      await server.close();
+    }
+
+    // 失败降级：不传 indexDataSourceId → 走内置默认索引表
+    assert.equal(
+      DEFAULT_INDEX_DATA_SOURCE_ID,
+      "413b4619-9bae-80ee-bde0-000bb0ba7fb0",
+      "默认值必须是「记忆目录」新表的 data source（旧内联表 acccf805 已归档）",
+    );
+    const broken = await fakeNotion(() => 500);
+    const memory2 = newMemory(broken.baseUrl);
+    try {
+      assert.equal(await memory2.indexText(), "", "读取失败降级为空字符串");
+      assert.equal(broken.requests, 1, "HTTP 500 不重试");
+      assert.equal(
+        broken.paths[0],
+        `/v1/data_sources/${DEFAULT_INDEX_DATA_SOURCE_ID}/query`,
+        "不配置时默认查内置索引表 data source",
+      );
+      assert.ok(
+        logs.some((line) => line.includes("记忆目录读取失败")),
+        `失败要留一条 warn，实际：${JSON.stringify(logs)}`,
+      );
+      assert.equal(await memory2.indexText(), "", "冷却期内仍返回空串");
+      assert.equal(broken.requests, 1, "失败冷却（60s）内不得每轮重打 Notion");
+    } finally {
+      memory2.close();
+      await broken.close();
     }
   });
 
