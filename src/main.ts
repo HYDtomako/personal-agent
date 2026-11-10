@@ -363,6 +363,7 @@ const server = new GuiServer({
   token: config.gui?.token,
   log,
   redact: redactSensitive,
+  redactSecrets: SECRETS,
   onMessage: (input) => { submitConversation(input); },
   onExternal: async (input) => {
     const request = submitConversation({ text: input.text });
