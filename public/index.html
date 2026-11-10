@@ -370,7 +370,7 @@ function canIntegrateDelegation(job) {
   return job.status === 'completed' && !!job.notifiedAt && !!delivery && delivery.state !== 'cleaned';
 }
 function delegationNeedsAttention(job) {
-  return job.deliveryHold === true || job.status === 'needs_attention' || canIntegrateDelegation(job)
+  return job.deliveryHold === true || job.status === 'needs_attention' || job.liveness === 'lost' || canIntegrateDelegation(job)
     || ['blocked', 'rolled_back', 'partial', 'failed'].includes(delegationDelivery(job)?.state);
 }
 function delegationOutstanding(job) {
@@ -380,13 +380,14 @@ function delegationOutstanding(job) {
 function delegationState(job) {
   const delivery = delegationDelivery(job);
   let label = delegationLabels.get(job.status) || '未知状态（' + String(job.status || '未提供') + '）';
-  if (delegationNeedsAttention(job)) return { label: label + ' · 需处理' + (job.deliveryHold === true ? '（交付挂起）' : ''), tone: 'attention' };
+  const link = job.liveness === 'lost' ? ' · 已失联' : job.liveness === 'suspect' ? ' · 暂时联系不上' : '';
+  if (delegationNeedsAttention(job)) return { label: label + link + ' · 需处理' + (job.deliveryHold === true ? '（交付挂起）' : ''), tone: 'attention' };
   if (job.status === 'completed') {
     if (delivery?.state === 'cleaned') return { label: label + ' · 已交付', tone: 'finished' };
     if (delivery?.state === 'verified') return { label: label + ' · 原目标复验通过', tone: 'finished' };
     return { label: label + (job.notifiedAt ? ' · 交付未确认' : ' · 验收/交付中'), tone: job.notifiedAt ? '' : 'active' };
   }
-  return { label, tone: activeDelegationStates.has(job.status) ? 'active' : ['failed', 'timed_out'].includes(job.status) ? 'error' : '' };
+  return { label: label + link, tone: activeDelegationStates.has(job.status) ? 'active' : ['failed', 'timed_out'].includes(job.status) ? 'error' : '' };
 }
 function delegationDeliveryText(job) {
   const delivery = delegationDelivery(job);

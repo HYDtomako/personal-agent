@@ -639,6 +639,28 @@ try {
     assert.equal(f.adapter.count("close"), 1);
   });
 
+  await check("liveness独立记录live/suspect/lost，恢复后回到live", async () => {
+    const f = fixture();
+    const submitted = f.submit(f.a, { timeoutMs: 600_000 });
+    assert.equal(submitted.liveness, "unknown");
+    f.manager.start();
+    const job = await running(f, submitted);
+    await until(() => f.manager.get(job.id).liveness === "live", "first poll marks live");
+    f.adapter.listFailure = true;
+    await f.advance(10_000);
+    assert.equal(f.manager.get(job.id).liveness, "suspect");
+    assert.equal(f.manager.get(job.id).status, "running");
+    await f.advance(60_000);
+    await until(() => f.manager.get(job.id).liveness === "lost", "lost after grace");
+    assert.equal(f.manager.get(job.id).status, "needs_attention");
+    assert(f.manager.get(job.id).livenessAt);
+    f.adapter.outputs.set(job.paneId, "recovered progress");
+    f.adapter.listFailure = false;
+    await f.advance(10);
+    await until(() => f.manager.get(job.id).liveness === "live", "live after recovery");
+    await until(() => f.manager.get(job.id).status === "running", "running after recovery");
+  });
+
   await check("旧测试报错不误杀；当前认证/审批+无进展提示attention，恢复后继续", async () => {
     const f = fixture();
     f.manager.start();

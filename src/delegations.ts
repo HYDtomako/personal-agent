@@ -45,6 +45,9 @@ export interface DelegationJob {
   status: DelegationStatus;
   /** Increments only when a replacement executor takes over; fences stale reports. */
   generation: number;
+  /** 通信状态，与执行状态分开：poll 暂时失败不等于任务失败。 */
+  liveness?: "unknown" | "live" | "suspect" | "lost";
+  livenessAt?: string;
   timeoutMs: number;
   createdAt: string;
   startedAt?: string;
@@ -282,7 +285,7 @@ export class DelegationManager {
       ...(projectIdentity ? { projectIdentity, projectKey: projectIdentity.projectKey } : {}),
       ...(direct ? { direct: true, executionCwd: location.cwd } : { deliveryManaged: true, deliveryAttempt: 0 }),
       source: copy(context.source), ...(requestId === undefined ? {} : { requestId }),
-      status: "queued", generation: 1, timeoutMs, createdAt: iso(this.now()),
+      status: "queued", generation: 1, liveness: "unknown", timeoutMs, createdAt: iso(this.now()),
       reportPath: path.join(this.resultsDir, `${id}.json`), lastOutput: "",
       message: direct ? "已持久化排队；CA 将直接在原项目修改，不创建隔离树。" : "已持久化排队；后台派发，不等待 CA 执行。",
     };
@@ -453,6 +456,7 @@ export class DelegationManager {
         // 旧存储没有 generation：按第一代读入，之后只允许更大代次接管。
         if (job.generation === undefined) job.generation = 1;
         if (!Number.isSafeInteger(job.generation) || job.generation < 1) throw new Error("任务 generation 无效");
+        if (job.liveness !== undefined && !["unknown", "live", "suspect", "lost"].includes(job.liveness)) throw new Error("任务 liveness 无效");
         if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(job.name) || !/^[a-z0-9][a-z0-9_-]{0,39}$/.test(job.worker) || job.task.length > 100_000) throw new Error("任务名称、worker或描述无效");
         if (!path.isAbsolute(job.cwd) || !path.isAbsolute(job.canonicalCwd)) throw new Error("任务目录无效");
         for (const key of ["direct", "deliveryManaged", "deliveryHold"] as const) {
@@ -540,6 +544,7 @@ export class DelegationManager {
     if (changed.includes("message") && after.message) detail.message = after.message.slice(0, 500);
     if (changed.includes("reportIssue") && after.reportIssue) detail.reportIssue = after.reportIssue.slice(0, 500);
     if (changed.includes("attentionReason") && after.attentionReason) detail.attentionReason = after.attentionReason;
+    if (changed.includes("liveness") && after.liveness) detail.liveness = after.liveness;
     if (changed.includes("monitorError") && after.monitorError) detail.monitorError = after.monitorError.slice(0, 500);
     if (changed.includes("cleanupError") && after.cleanupError) detail.cleanupError = after.cleanupError.slice(0, 500);
     this.trace(after, "state", detail);
@@ -560,6 +565,13 @@ export class DelegationManager {
     } catch (error) {
       this.log("[delegations] trace", job.id, errorText(error));
     }
+  }
+
+  /** 只在通信状态真正变化时写盘，避免每 5 秒一次空更新。 */
+  private setLiveness(id: string, liveness: NonNullable<DelegationJob["liveness"]>, now: number): DelegationJob {
+    const current = this.jobs.get(id)!;
+    if (current.liveness === liveness) return current;
+    return this.update(id, { liveness, livenessAt: iso(now) });
   }
   private kick(): void {
     if (!this.running || this.scheduled) return;
@@ -806,18 +818,21 @@ export class DelegationManager {
       if (agent) {
         const mismatch = this.identityMismatch(current, agent);
         if (mismatch) {
+          this.setLiveness(id, "lost", now);
           this.update(id, { cleanupBlocked: true, cleanupError: mismatch });
           this.finish(id, "failed", `interrupted：${mismatch}；不重新投递，也不关闭可能已被替换的终端。`);
           return;
         }
         if (current.terminalId === undefined) {
           // A recorded pane without a recorded terminal cannot prove that herdr survived a restart.
+          this.setLiveness(id, "suspect", now);
           this.attention(id, "identity", "缺少原 terminal_id，无法证明仍是原 CA；不重派，保留项目锁供人工处理。");
           return;
         }
         const session = this.sessionIdentity(agent.agent_session);
         if (session) current = this.update(id, { agentSession: { ...session, ...current.agentSession } });
         this.identityValidated.set(id, epoch);
+        current = this.setLiveness(id, "live", now);
       }
       let progressed = false;
       if (output.status === "fulfilled") {
@@ -837,7 +852,9 @@ export class DelegationManager {
       if (!agent) {
         const reason = listed.status === "rejected" ? `herdr 查询暂不可用：${errorText(listed.reason)}` : "当前 agent 列表暂未找到持久化 pane；不会重新投递";
         current = this.update(id, { monitorError: reason, unavailableSince: current.unavailableSince ?? iso(now), missingReportSince: undefined });
-        if (now - Date.parse(current.unavailableSince!) >= Math.max(60_000, this.pollIntervalMs * 2) && now - Date.parse(current.lastProgressAt!) >= QUIET_BLOCKED_MS) this.attention(id, "unavailable", `${reason}；保留监管及总 deadline。`);
+        const lost = now - Date.parse(current.unavailableSince!) >= Math.max(60_000, this.pollIntervalMs * 2);
+        current = this.setLiveness(id, lost ? "lost" : "suspect", now);
+        if (lost && now - Date.parse(current.lastProgressAt!) >= QUIET_BLOCKED_MS) this.attention(id, "unavailable", `${reason}；保留监管及总 deadline。`);
         return;
       }
       current = this.update(id, { monitorError: output.status === "rejected" ? `终端快照暂不可读：${errorText(output.reason)}` : undefined, unavailableSince: undefined });
