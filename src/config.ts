@@ -23,6 +23,10 @@ export interface AgentConfig {
     maxConcurrent?: number;
     /** PA 单轮时限，不包含后台 CA 的执行时间。 */
     timeoutMs?: number;
+    /** 观察到的工具调用预算；默认 100，0 关闭。 */
+    maxToolCalls?: number;
+    /** 相同参数、相同结果的连续工具失败阈值；默认 5，0 关闭。 */
+    maxRepeatedToolFailures?: number;
   };
   gui: {
     /** 监听地址；127.0.0.1=只本机。改成 0.0.0.0 必须同时设 token */
@@ -131,6 +135,10 @@ export function loadConfig(path: string): AgentConfig {
   };
   positive("agent.timeoutMs", cfg.agent.timeoutMs);
   positive("agent.maxConcurrent", cfg.agent.maxConcurrent);
+  for (const field of ["maxToolCalls", "maxRepeatedToolFailures"] as const) {
+    const value = cfg.agent[field];
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) throw new Error(`config ${path}: agent.${field} 必须是非负整数`);
+  }
   positive("notion.timeoutMs", cfg.notion?.timeoutMs);
   positive("notion.connectTimeoutMs", cfg.notion?.connectTimeoutMs);
   positive("memory.cacheTtlSeconds", cfg.memory?.cacheTtlSeconds);
