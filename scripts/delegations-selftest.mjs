@@ -186,7 +186,7 @@ function fixture(options = {}) {
   return { root, a, b, c, clock, adapter, events, opts, manager, submit, advance };
 }
 function report(job, status = "completed", extra = {}) {
-  fs.writeFileSync(job.reportPath, JSON.stringify({ jobId: job.id, status, summary: "fake self-report only", tests: ["fake test"], changedFiles: ["fake.ts"], ...extra }));
+  fs.writeFileSync(job.reportPath, JSON.stringify({ jobId: job.id, generation: job.generation, status, summary: "fake self-report only", tests: ["fake test"], changedFiles: ["fake.ts"], ...extra }));
 }
 async function running(f, job) {
   await until(() => f.manager.get(job.id)?.status === "running", `${job.id} running`);
@@ -327,6 +327,8 @@ try {
       assert.equal(job.launchPhase, "prompting");
       assert(text.includes(job.reportPath));
       assert(text.includes(job.id));
+      assert(text.includes(`"generation":${job.generation}`));
+      assert(text.includes("代次不符"));
       assert(!text.includes("request-fake"));
       assert(!text.includes("threadId"));
       assert(text.includes("原任务授权不扩张"));
@@ -380,6 +382,32 @@ try {
     const failed = await terminal(f, job, "failed");
     assert.equal(failed.report.status, "failed");
     assert.equal(f.events[0].event, "terminal");
+  });
+
+  await check("报告代次：旧代次被拒，接管后只认当前代次", async () => {
+    const f = fixture();
+    f.manager.start();
+    const job = await running(f, f.submit());
+    report(job, "completed", { generation: job.generation + 1 });
+    await until(() => /generation|代次/.test(f.manager.get(job.id).reportIssue ?? ""), "stale generation rejected");
+    assert.equal(f.manager.get(job.id).status, "running");
+    report(job);
+    const done = await terminal(f, job, "completed");
+    assert.equal(done.report.generation, job.generation);
+
+    const g = fixture();
+    g.manager.start();
+    const old = await running(g, g.submit());
+    const next = reopen(g, (jobs) => { jobs[0].generation = 2; });
+    next.start();
+    fs.writeFileSync(old.reportPath, JSON.stringify({ jobId: old.id, status: "completed", summary: "legacy shape" }));
+    await until(() => /缺少 generation/.test(next.get(old.id).reportIssue ?? ""), "legacy report rejected after takeover");
+    report(old, "completed", { generation: 1 });
+    await until(() => /代次/.test(next.get(old.id).reportIssue ?? ""), "old generation rejected");
+    assert.equal(next.get(old.id).status, "running");
+    report(old, "completed", { generation: 2 });
+    const finished = await terminal({ manager: next }, old, "completed");
+    assert.equal(finished.report.generation, 2);
   });
 
   await check("终态回调失败可重试；长回调不阻塞其他任务和聊天快照", async () => {

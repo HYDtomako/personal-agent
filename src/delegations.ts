@@ -12,6 +12,8 @@ import type { DeliveryRecord, ProjectIdentity } from "./project-delivery.ts";
 export type DelegationStatus = "queued" | "starting" | "running" | "needs_attention" | "completed" | "failed" | "timed_out" | "cancelled";
 export interface DelegationReport {
   jobId: string;
+  /** Execution generation the CA was launched with; stale generations are rejected. */
+  generation?: number;
   status: "completed" | "failed";
   summary: string;
   tests?: unknown;
@@ -41,6 +43,8 @@ export interface DelegationJob {
   source: ReplySource;
   requestId?: string;
   status: DelegationStatus;
+  /** Increments only when a replacement executor takes over; fences stale reports. */
+  generation: number;
   timeoutMs: number;
   createdAt: string;
   startedAt?: string;
@@ -271,7 +275,7 @@ export class DelegationManager {
       ...(projectIdentity ? { projectIdentity, projectKey: projectIdentity.projectKey } : {}),
       ...(direct ? { direct: true, executionCwd: location.cwd } : { deliveryManaged: true, deliveryAttempt: 0 }),
       source: copy(context.source), ...(requestId === undefined ? {} : { requestId }),
-      status: "queued", timeoutMs, createdAt: iso(this.now()),
+      status: "queued", generation: 1, timeoutMs, createdAt: iso(this.now()),
       reportPath: path.join(this.resultsDir, `${id}.json`), lastOutput: "",
       message: direct ? "已持久化排队；CA 将直接在原项目修改，不创建隔离树。" : "已持久化排队；后台派发，不等待 CA 执行。",
     };
@@ -438,6 +442,9 @@ export class DelegationManager {
           if (typeof (job as any)[key] !== "string" || !(job as any)[key]) throw new Error(`任务缺少 ${key}`);
         }
         if (!/^ca-[0-9a-f-]{36}$/.test(job.id) || !STATUSES.has(job.status) || typeof job.lastOutput !== "string" || job.lastOutput.length > OUTPUT_LIMIT) throw new Error("任务标识、状态或输出快照无效");
+        // 旧存储没有 generation：按第一代读入，之后只允许更大代次接管。
+        if (job.generation === undefined) job.generation = 1;
+        if (!Number.isSafeInteger(job.generation) || job.generation < 1) throw new Error("任务 generation 无效");
         if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(job.name) || !/^[a-z0-9][a-z0-9_-]{0,39}$/.test(job.worker) || job.task.length > 100_000) throw new Error("任务名称、worker或描述无效");
         if (!path.isAbsolute(job.cwd) || !path.isAbsolute(job.canonicalCwd)) throw new Error("任务目录无效");
         for (const key of ["direct", "deliveryManaged", "deliveryHold"] as const) {
@@ -703,7 +710,8 @@ export class DelegationManager {
       : !job.deliveryManaged ? "" : `不要自行 commit/push/stash/reset/merge 或删除工作树；PA 会独立验收、回写原项目、目标复验并清理磁盘工作树。herdr 终端关闭不等同于磁盘工作树清理。\n`;
     return `${job.task}\n\n${files}${delivery}[后台任务结果报告约定]\n任务 ID：${job.id}\n` +
       `最后一步将 UTF-8 JSON 写入此绝对路径（可先写临时文件再原子重命名）：${job.reportPath}\n` +
-      `格式：${JSON.stringify({ jobId: job.id, status: "completed", summary: "本轮实际结果与未完成项", tests: [], changedFiles: [] })}\n` +
+      `格式：${JSON.stringify({ jobId: job.id, generation: job.generation, status: "completed", summary: "本轮实际结果与未完成项", tests: [], changedFiles: [] })}\n` +
+      `generation 必须等于 ${job.generation}；代次不符的报告会被拒绝（来自旧执行者）。\n` +
       `status 只能是 completed 或 failed；无法完成也必须写 failed 及真实原因。summary 必须是字符串。` +
       `tests 可列实际执行的命令及结果，changedFiles 可列改动路径，不得虚构验证。报告不超过 64 KiB。` +
       `此文件只是 CA 自述，主线程另行独立验收。写报告后不要继续修改项目。除任务必需信息外，不读取或写入个人记忆、凭据或密钥。\n` +
@@ -728,7 +736,11 @@ export class DelegationManager {
       if (length > REPORT_LIMIT) throw new Error("报告超过 64 KiB 上限");
       const report = JSON.parse(bytes.subarray(0, length).toString("utf8"));
       if (!report || report.jobId !== job.id || !["completed", "failed"].includes(report.status) || typeof report.summary !== "string" || !report.summary.trim()) throw new Error("报告 jobId/status/summary 无效或不匹配");
-      return { jobId: job.id, status: report.status, summary: report.summary, ...(report.tests === undefined ? {} : { tests: report.tests }), ...(report.changedFiles === undefined ? {} : { changedFiles: report.changedFiles }) };
+      if (report.generation !== undefined && (!Number.isSafeInteger(report.generation) || report.generation < 1)) throw new Error("报告 generation 无效");
+      // 第 1 代兼容升级前未带 generation 的旧报告；一旦发生接管，只认当前代次。
+      if (report.generation === undefined && job.generation > 1) throw new Error(`报告缺少 generation；当前已是第 ${job.generation} 代，拒绝旧格式报告`);
+      if (report.generation !== undefined && report.generation !== job.generation) throw new Error(`报告 generation=${report.generation} 与当前执行代次 ${job.generation} 不符；已拒绝旧执行者提交`);
+      return { jobId: job.id, generation: job.generation, status: report.status, summary: report.summary, ...(report.tests === undefined ? {} : { tests: report.tests }), ...(report.changedFiles === undefined ? {} : { changedFiles: report.changedFiles }) };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") this.update(job.id, { reportIssue: errorText(error) });
       return undefined;
