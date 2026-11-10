@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import {
-  closeSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync,
+  appendFileSync, closeSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync,
   readFileSync, readSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync,
 } from "node:fs";
 import path from "node:path";
@@ -98,6 +98,8 @@ export interface DelegationManagerOptions {
   pollIntervalMs?: number;
   startupTimeoutMs?: number;
   onEvent?: (job: DelegationJob, event: "terminal" | "attention") => Promise<void>;
+  /** 追加执行轨迹的目录；默认在任务存储同级的 delegation-trace/。 */
+  traceDir?: string;
   log?: (...args: unknown[]) => void;
   now?: () => number;
 }
@@ -115,6 +117,8 @@ const DELIVERY_RETRY_WINDOW_MS = 24 * 60 * 60_000;
 const MAX_DELIVERY_ATTEMPTS = 2;
 /** Only recent, still-actionable terminal jobs are shown as background context. */
 const BACKGROUND_TERMINAL_WINDOW_MS = 24 * 60 * 60_000;
+/** Per-job append-only trace cap. State changes are small; this is only a runaway guard. */
+const TRACE_LIMIT = 2 * 1024 * 1024;
 
 function errorText(error: unknown): string { return (error instanceof Error ? error.message : String(error)).slice(-3000); }
 function positive(value: number | undefined, fallback: number, name: string): number {
@@ -176,6 +180,7 @@ function canonical(cwd: string): { cwd: string; key: string } {
 export class DelegationManager {
   private readonly file: string;
   private readonly resultsDir: string;
+  private readonly traceDir: string;
   private readonly adapter: HerdrAdapterLike;
   private readonly delivery?: DelegationManagerOptions["delivery"];
   private readonly deliveryMode: "direct" | "worktree";
@@ -201,11 +206,13 @@ export class DelegationManager {
   private notifications = new Map<string, symbol>();
   private terminalCallbacks = new Set<string>();
   private notificationAttempts = new Map<string, number>();
+  private traceCapped = new Set<string>();
   private storageError?: Error;
 
   constructor(opts: DelegationManagerOptions) {
     this.file = path.resolve(opts.file);
     this.resultsDir = path.resolve(opts.resultsDir);
+    this.traceDir = opts.traceDir ? path.resolve(opts.traceDir) : path.join(path.dirname(this.file), "delegation-trace");
     this.adapter = opts.adapter ?? new HerdrAdapter();
     this.delivery = opts.delivery;
     this.deliveryMode = opts.deliveryMode ?? "worktree";
@@ -281,6 +288,7 @@ export class DelegationManager {
     };
     mkdirSync(this.resultsDir, { recursive: true });
     this.commit(job);
+    this.trace(job, "created", { status: job.status, direct: Boolean(job.direct), worker: job.worker });
     this.kick();
     return copy(job);
   }
@@ -513,8 +521,45 @@ export class DelegationManager {
   private update(id: string, patch: Partial<DelegationJob>): DelegationJob {
     const current = this.jobs.get(id)!;
     const next = { ...current, ...patch };
-    if (JSON.stringify(current) !== JSON.stringify(next)) this.commit(next);
+    if (JSON.stringify(current) !== JSON.stringify(next)) {
+      this.commit(next);
+      this.traceState(current, next, patch);
+    }
     return this.jobs.get(id)!;
+  }
+
+  /** 状态变化写一条轨迹；只记录变化字段，不把整份输出快照落盘。 */
+  private traceState(before: DelegationJob, after: DelegationJob, patch: Partial<DelegationJob>): void {
+    const changed = Object.keys(patch).filter((key) =>
+      key !== "lastOutput" && JSON.stringify((before as any)[key]) !== JSON.stringify((after as any)[key]),
+    );
+    if (!changed.length) return;
+    const detail: Record<string, unknown> = { status: after.status, changes: changed };
+    if (changed.includes("status")) detail.fromStatus = before.status;
+    if (changed.includes("launchPhase") && after.launchPhase) detail.launchPhase = after.launchPhase;
+    if (changed.includes("message") && after.message) detail.message = after.message.slice(0, 500);
+    if (changed.includes("reportIssue") && after.reportIssue) detail.reportIssue = after.reportIssue.slice(0, 500);
+    if (changed.includes("attentionReason") && after.attentionReason) detail.attentionReason = after.attentionReason;
+    if (changed.includes("monitorError") && after.monitorError) detail.monitorError = after.monitorError.slice(0, 500);
+    if (changed.includes("cleanupError") && after.cleanupError) detail.cleanupError = after.cleanupError.slice(0, 500);
+    this.trace(after, "state", detail);
+  }
+
+  /** 追加一条 JSONL；轨迹失败只记日志，绝不影响任务监管。 */
+  private trace(job: DelegationJob, event: string, detail: Record<string, unknown> = {}): void {
+    try {
+      if (this.traceCapped.has(job.id)) return;
+      const file = path.join(this.traceDir, `${job.id}.jsonl`);
+      if (existsSync(file) && statSync(file).size >= TRACE_LIMIT) {
+        appendFileSync(file, JSON.stringify({ at: iso(this.now()), job: job.id, event: "trace_capped" }) + "\n", "utf8");
+        this.traceCapped.add(job.id);
+        return;
+      }
+      mkdirSync(this.traceDir, { recursive: true });
+      appendFileSync(file, JSON.stringify({ at: iso(this.now()), job: job.id, event, ...detail }) + "\n", "utf8");
+    } catch (error) {
+      this.log("[delegations] trace", job.id, errorText(error));
+    }
   }
   private kick(): void {
     if (!this.running || this.scheduled) return;
@@ -869,6 +914,11 @@ export class DelegationManager {
     this.update(id, {
       status, message, finishedAt: iso(this.now()), ...(report ? { report, reportIssue: undefined } : {}),
       cleanupPending: Boolean(job.workspaceId || this.launches.has(id)),
+    });
+    this.trace(this.jobs.get(id)!, "terminal", {
+      status,
+      message: message.slice(0, 500),
+      ...(report ? { reportStatus: report.status } : {}),
     });
     this.notify(this.jobs.get(id)!, "terminal");
     void this.cleanup(id).catch((error) => this.log("[delegations] cleanup", errorText(error)));

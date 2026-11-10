@@ -364,6 +364,22 @@ try {
     await assert.rejects(() => f.manager.reply(job.id, "again"), /不能复活/);
   });
 
+  await check("执行trace逐条记录created/state/terminal，可解析且不含输出快照", async () => {
+    const f = fixture();
+    f.manager.start();
+    const job = await running(f, f.submit());
+    report(job);
+    await terminal(f, job, "completed");
+    const file = path.join(f.root, "delegation-trace", `${job.id}.jsonl`);
+    const lines = fs.readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(lines[0].event, "created");
+    assert(lines.some((line) => line.event === "state" && line.status === "running"));
+    assert(lines.some((line) => line.event === "terminal" && line.status === "completed"));
+    assert(lines.every((line) => line.job === job.id));
+    assert(lines.every((line) => !(line.changes ?? []).includes("lastOutput")));
+    assert(lines.every((line) => typeof line.at === "string" && Number.isFinite(Date.parse(line.at))));
+  });
+
   await check("错误jobId、部分JSON与超大报告不误判成功；有效failed报告触发通知", async () => {
     const f = fixture();
     f.manager.start();
