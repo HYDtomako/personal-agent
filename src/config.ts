@@ -23,6 +23,8 @@ export interface AgentConfig {
     maxConcurrent?: number;
     /** PA 单轮时限，不包含后台 CA 的执行时间。 */
     timeoutMs?: number;
+    /** 本轮追加背景 JSON 的字符预算，不截断用户原文；默认 12000。 */
+    maxBackgroundChars?: number;
   };
   gui: {
     /** 监听地址；127.0.0.1=只本机。改成 0.0.0.0 必须同时设 token */
@@ -131,6 +133,8 @@ export function loadConfig(path: string): AgentConfig {
   };
   positive("agent.timeoutMs", cfg.agent.timeoutMs);
   positive("agent.maxConcurrent", cfg.agent.maxConcurrent);
+  positive("agent.maxBackgroundChars", cfg.agent.maxBackgroundChars);
+  if (cfg.agent.maxBackgroundChars !== undefined && cfg.agent.maxBackgroundChars < 2) throw new Error(`config ${path}: agent.maxBackgroundChars 至少为 2`);
   positive("notion.timeoutMs", cfg.notion?.timeoutMs);
   positive("notion.connectTimeoutMs", cfg.notion?.connectTimeoutMs);
   positive("memory.cacheTtlSeconds", cfg.memory?.cacheTtlSeconds);

@@ -29,6 +29,7 @@
     "smoke": "node scripts/smoke.ts",
     "selftest:docparse": "node scripts/docparse-selftest.ts",
     "selftest:video": "node scripts/video-selftest.ts",
-    "video:subtitle": "node scripts/video-subtitle.ts"
+    "video:subtitle": "node scripts/video-subtitle.ts",
+    "selftest:context": "node --test scripts/context-selftest.mjs"
   }
 }
