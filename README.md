@@ -97,7 +97,7 @@ PA 的对话轮次与 CA 编码任务现在分开运行。`agent_dispatch` 只�
 
 执行器自身的首次目录 Trust 门独立于自动参数。PA 仅在实际弹框目录与本任务 cwd 精确相符、且启动前及确认前都未发现项目 MCP 配置文件时自动确认；每次后续启动仍会重新检查。有项目 MCP 文件、Git 根无法确认或配置不可读时拒绝自动启用并明确报告。这个原生目录信任会持久化，不绑定 MCP 内容；在终端里手工启动执行器不经过 PA 的前置检查，仍遵循该执行器自己的信任语义。用户级 MCP 配置未修改。
 
-后台任务记录在 `memory/delegations.json`，CA 结果报告在 `memory/delegation-results/`，独立验收记录在 `memory/delegation-reviews/`。`completed` 只代表 CA 提交了完成报告；系统再核对实际文件与测试，无法核实会明确显示尚未验收，不能把接收或执行结束当成成功。
+后台任务记录在 `memory/delegations.json`，CA 结果报告在 `memory/delegation-results/`，独立验收记录在 `memory/delegation-reviews/`。每个任务的状态变化按行追加到 `memory/delegation-trace/<任务id>.jsonl`（单任务 2 MiB 上限），用于排查失联、接管和验收阶段；输出快照不写进轨迹。`completed` 只代表 CA 提交了完成报告；系统再核对实际文件与测试，无法核实会明确显示尚未验收，不能把接收或执行结束当成成功。
 
 所有聊天入口共用短轮次队列，避免并发写同一个模型会话。请求存于 `memory/requests.json`；重启时原 running 对话标记中断而不是盲目重跑，已派发的 CA 独立恢复监管。后台会核对 herdr terminal/session 身份；如果 herdr 自身重启导致终端替换，报告中断，不假装原任务仍在运行，也不自动重复编码。
 

@@ -186,7 +186,7 @@ function fixture(options = {}) {
   return { root, a, b, c, clock, adapter, events, opts, manager, submit, advance };
 }
 function report(job, status = "completed", extra = {}) {
-  fs.writeFileSync(job.reportPath, JSON.stringify({ jobId: job.id, status, summary: "fake self-report only", tests: ["fake test"], changedFiles: ["fake.ts"], ...extra }));
+  fs.writeFileSync(job.reportPath, JSON.stringify({ jobId: job.id, generation: job.generation, status, summary: "fake self-report only", tests: ["fake test"], changedFiles: ["fake.ts"], ...extra }));
 }
 async function running(f, job) {
   await until(() => f.manager.get(job.id)?.status === "running", `${job.id} running`);
@@ -327,6 +327,8 @@ try {
       assert.equal(job.launchPhase, "prompting");
       assert(text.includes(job.reportPath));
       assert(text.includes(job.id));
+      assert(text.includes(`"generation":${job.generation}`));
+      assert(text.includes("代次不符"));
       assert(!text.includes("request-fake"));
       assert(!text.includes("threadId"));
       assert(text.includes("原任务授权不扩张"));
@@ -362,6 +364,22 @@ try {
     await assert.rejects(() => f.manager.reply(job.id, "again"), /不能复活/);
   });
 
+  await check("执行trace逐条记录created/state/terminal，可解析且不含输出快照", async () => {
+    const f = fixture();
+    f.manager.start();
+    const job = await running(f, f.submit());
+    report(job);
+    await terminal(f, job, "completed");
+    const file = path.join(f.root, "delegation-trace", `${job.id}.jsonl`);
+    const lines = fs.readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(lines[0].event, "created");
+    assert(lines.some((line) => line.event === "state" && line.status === "running"));
+    assert(lines.some((line) => line.event === "terminal" && line.status === "completed"));
+    assert(lines.every((line) => line.job === job.id));
+    assert(lines.every((line) => !(line.changes ?? []).includes("lastOutput")));
+    assert(lines.every((line) => typeof line.at === "string" && Number.isFinite(Date.parse(line.at))));
+  });
+
   await check("错误jobId、部分JSON与超大报告不误判成功；有效failed报告触发通知", async () => {
     const f = fixture();
     f.manager.start();
@@ -380,6 +398,32 @@ try {
     const failed = await terminal(f, job, "failed");
     assert.equal(failed.report.status, "failed");
     assert.equal(f.events[0].event, "terminal");
+  });
+
+  await check("报告代次：旧代次被拒，接管后只认当前代次", async () => {
+    const f = fixture();
+    f.manager.start();
+    const job = await running(f, f.submit());
+    report(job, "completed", { generation: job.generation + 1 });
+    await until(() => /generation|代次/.test(f.manager.get(job.id).reportIssue ?? ""), "stale generation rejected");
+    assert.equal(f.manager.get(job.id).status, "running");
+    report(job);
+    const done = await terminal(f, job, "completed");
+    assert.equal(done.report.generation, job.generation);
+
+    const g = fixture();
+    g.manager.start();
+    const old = await running(g, g.submit());
+    const next = reopen(g, (jobs) => { jobs[0].generation = 2; });
+    next.start();
+    fs.writeFileSync(old.reportPath, JSON.stringify({ jobId: old.id, status: "completed", summary: "legacy shape" }));
+    await until(() => /缺少 generation/.test(next.get(old.id).reportIssue ?? ""), "legacy report rejected after takeover");
+    report(old, "completed", { generation: 1 });
+    await until(() => /代次/.test(next.get(old.id).reportIssue ?? ""), "old generation rejected");
+    assert.equal(next.get(old.id).status, "running");
+    report(old, "completed", { generation: 2 });
+    const finished = await terminal({ manager: next }, old, "completed");
+    assert.equal(finished.report.generation, 2);
   });
 
   await check("终态回调失败可重试；长回调不阻塞其他任务和聊天快照", async () => {
@@ -593,6 +637,28 @@ try {
     await f.advance(10);
     await until(() => f.manager.get(job.id).closedAt, "cleanup recovered");
     assert.equal(f.adapter.count("close"), 1);
+  });
+
+  await check("liveness独立记录live/suspect/lost，恢复后回到live", async () => {
+    const f = fixture();
+    const submitted = f.submit(f.a, { timeoutMs: 600_000 });
+    assert.equal(submitted.liveness, "unknown");
+    f.manager.start();
+    const job = await running(f, submitted);
+    await until(() => f.manager.get(job.id).liveness === "live", "first poll marks live");
+    f.adapter.listFailure = true;
+    await f.advance(10_000);
+    assert.equal(f.manager.get(job.id).liveness, "suspect");
+    assert.equal(f.manager.get(job.id).status, "running");
+    await f.advance(60_000);
+    await until(() => f.manager.get(job.id).liveness === "lost", "lost after grace");
+    assert.equal(f.manager.get(job.id).status, "needs_attention");
+    assert(f.manager.get(job.id).livenessAt);
+    f.adapter.outputs.set(job.paneId, "recovered progress");
+    f.adapter.listFailure = false;
+    await f.advance(10);
+    await until(() => f.manager.get(job.id).liveness === "live", "live after recovery");
+    await until(() => f.manager.get(job.id).status === "running", "running after recovery");
   });
 
   await check("旧测试报错不误杀；当前认证/审批+无进展提示attention，恢复后继续", async () => {
