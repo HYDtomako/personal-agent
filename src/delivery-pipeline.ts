@@ -1,5 +1,4 @@
 import type { ProjectDelivery, DeliveryRecord, ReviewResult, ProjectIdentity } from "./project-delivery.ts";
-import { factsFromDelivery } from "./user-notice.ts";
 
 export interface DeliveryJob {
   id: string; cwd: string; task: string; status: string; deliveryManaged?: boolean; deliveryAttempt?: number;
@@ -17,9 +16,11 @@ type Engine = Pick<ProjectDelivery, "get" | "capture" | "markReview" | "apply" |
 
 /** 任务列表上的短状态。 */
 export function deliveryText(record: DeliveryRecord): string {
-  const facts = factsFromDelivery(record);
-  if (facts.verdict === "unverified") return "这块还没核过";
-  return facts.changed;
+  const failed = record.executionReview?.verdict === "failed" || record.targetReview?.verdict === "failed";
+  if ((record.state === "verified" || record.state === "cleaned") && record.targetReview?.verdict === "passed") return "原项目已更新";
+  if (record.state === "rolled_back") return "改动已撤回";
+  if (failed) return "验收没通过";
+  return "这块还没核过";
 }
 
 interface PipelineOptions {

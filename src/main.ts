@@ -19,10 +19,7 @@ import { createHash } from "node:crypto";
 import { ProjectDelivery, type DeliveryRecord, type ReviewResult } from "./project-delivery.ts";
 import { DeliveryPipeline, deliveryText } from "./delivery-pipeline.ts";
 import { parseReviewResult } from "./review-result.ts";
-import {
-  NOTICE_FALLBACK, attentionNotice, cleanupHoldFacts, exceptionFacts, factsFromDelivery, factsFromReview,
-  failureFacts, finalizeUserNotice, noticePrompt, unsettledFacts, type AcceptanceFacts,
-} from "./user-notice.ts";
+import { NOTICE_FALLBACK, acceptUserCopy, attentionNotice, retellPrompt, type RetellInput } from "./user-notice.ts";
 import { collectConfigSecrets, redactText } from "./redact.ts";
 
 /**
@@ -642,9 +639,9 @@ function broadcastJobs(): void {
   server.broadcast("delegations", JSON.parse(redactSensitive(JSON.stringify({ jobs }))));
 }
 
-/** 用验收事实请模型写一句通知。调用失败或句子不合格时只用固定短句。 */
-async function speakFromFacts(facts: AcceptanceFacts): Promise<string> {
-  const prompt = noticePrompt(facts);
+/** 把 CA 交付交给 PA 转述。调用失败或转述不合格时只用固定短句。 */
+async function retellForUser(input: RetellInput, guard: string[]): Promise<string> {
+  const prompt = retellPrompt(input);
   try {
     const result = await reviewRunner.run(prompt, {
       model: currentModelSpec(),
@@ -652,7 +649,7 @@ async function speakFromFacts(facts: AcceptanceFacts): Promise<string> {
       timeoutMs: Math.min(45_000, reviewTimeoutMs),
     });
     if (!result?.ok || typeof result.text !== "string") return NOTICE_FALLBACK;
-    return finalizeUserNotice(result.text, facts);
+    return acceptUserCopy(result.text, guard);
   } catch {
     return NOTICE_FALLBACK;
   }
@@ -668,22 +665,34 @@ async function handleDelegationEvent(job: DelegationJob, event: "terminal" | "at
     if (event === "attention") {
       text = attentionNotice(job.id, job.message);
     } else {
-      let facts: AcceptanceFacts;
-      if (job.status === "completed") {
-        if (job.cleanupPending && !job.closedAt) facts = unsettledFacts();
-        else if (job.deliveryManaged) {
-          const outcome = await deliveryPipeline.run(job);
-          delegations.setDeliveryHold(job.id, outcome.holdProject, outcome.holdProject ? "文件交付状态不确定，保留项目锁" : undefined);
-          facts = outcome.interrupted ? exceptionFacts(outcome.interruptError) : factsFromDelivery(outcome.record);
-        } else {
-          const review = await reviewDelegation(job);
-          facts = factsFromReview({ verdict: review.verdict, summary: review.summary, stage: review.stage });
-        }
-      } else facts = failureFacts(job.status, job.deliveryManaged ? "delivery" : job.direct ? "direct" : "plain");
-      if (job.cleanupError) facts = cleanupHoldFacts();
+      let review: { verdict?: string; summary?: string } | undefined;
+      let outcome: { interrupted?: boolean; holdProject?: boolean; record?: { targetReview?: { verdict?: string; summary?: string }; executionReview?: { verdict?: string; summary?: string } } } | undefined;
+      if (job.status === "completed" && !(job.cleanupPending && !job.closedAt)) {
+        if (job.deliveryManaged) {
+          outcome = await deliveryPipeline.run(job);
+          delegations.setDeliveryHold(job.id, Boolean(outcome.holdProject), outcome.holdProject ? "文件交付状态不确定，保留项目锁" : undefined);
+        } else review = await reviewDelegation(job);
+      }
+      const unsettled = Boolean(job.cleanupError) || Boolean(job.cleanupPending && !job.closedAt) || Boolean(outcome?.interrupted);
+      const picked = outcome?.record?.targetReview ?? outcome?.record?.executionReview;
+      const acceptance = unsettled
+        ? { verdict: "unverified", summary: "" }
+        : review
+          ? { verdict: review.verdict, summary: review.summary }
+          : picked
+            ? { verdict: picked.verdict, summary: picked.summary }
+            : undefined;
+      const note = unsettled
+        ? "收尾还没确认，不能把结果说成已经落稳"
+        : job.status === "completed"
+          ? ""
+          : "这次没有做完独立验收";
+      const guard = [JSON.stringify(job.report ?? ""), job.lastOutput];
       let spoken = NOTICE_FALLBACK;
-      try { spoken = await speakFromFacts(facts); } catch { spoken = NOTICE_FALLBACK; }
-      text = finalizeUserNotice(spoken, facts);
+      try {
+        spoken = await retellForUser({ task: job.task, status: job.status, report: job.report, acceptance, note }, guard);
+      } catch { spoken = NOTICE_FALLBACK; }
+      text = acceptUserCopy(spoken, guard);
     }
     text = redactSensitive(text);
     notifications.put({ id, source: job.source, text: job.source.channel === "qq" ? text.slice(0, 3000) : text, kind: event === "attention" ? "attention" : "job" });
