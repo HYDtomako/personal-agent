@@ -20,7 +20,7 @@ import { createHash } from "node:crypto";
 import { ProjectDelivery, type DeliveryRecord, type ReviewResult } from "./project-delivery.ts";
 import { DeliveryPipeline, deliveryText } from "./delivery-pipeline.ts";
 import { parseReviewResult } from "./review-result.ts";
-import { cleanupHoldNotice, failureNotice, finalizeUserNotice, unsettledNotice, userNoticeFromReview } from "./user-notice.ts";
+import { NOTICE_FALLBACK, acceptUserCopy, attentionNotice, retellPrompt, type RetellInput } from "./user-notice.ts";
 import { collectConfigSecrets, redactText } from "./redact.ts";
 
 /**
@@ -632,6 +632,22 @@ function broadcastJobs(): void {
   server.broadcast("delegations", JSON.parse(redactSensitive(JSON.stringify({ jobs }))));
 }
 
+/** 把 CA 交付交给 PA 转述。调用失败或转述不合格时只用固定短句。 */
+async function retellForUser(input: RetellInput, guard: string[]): Promise<string> {
+  const prompt = retellPrompt(input);
+  try {
+    const result = await reviewRunner.run(prompt, {
+      model: currentModelSpec(),
+      noTools: true,
+      timeoutMs: Math.min(45_000, reviewTimeoutMs),
+    });
+    if (!result?.ok || typeof result.text !== "string") return NOTICE_FALLBACK;
+    return acceptUserCopy(result.text, guard);
+  } catch {
+    return NOTICE_FALLBACK;
+  }
+}
+
 async function handleDelegationEvent(job: DelegationJob, event: "terminal" | "attention"): Promise<void> {
   broadcastJobs();
   const stamp = event === "attention" ? String(job.attentionSequence ?? job.attentionAt ?? job.lastProgressAt ?? job.createdAt) : "terminal";
@@ -640,17 +656,37 @@ async function handleDelegationEvent(job: DelegationJob, event: "terminal" | "at
   let text = existing?.text;
   if (!text) {
     if (event === "attention") {
-      text = `后台任务 ${job.id} 需要关注：${job.message || "连续一段时间未观察到进展"}。\n任务未因 PA 对话结束而停止，整体执行时限仍有效；你可以继续聊天或取消该任务。`;
-    } else if (job.status === "completed") {
-      if (job.cleanupPending && !job.closedAt) text = unsettledNotice();
-      else if (job.deliveryManaged) {
-        const outcome = await deliveryPipeline.run(job);
-        delegations.setDeliveryHold(job.id, outcome.holdProject, outcome.holdProject ? "文件交付状态不确定，保留项目锁" : undefined);
-        text = outcome.text;
-      } else text = (await reviewDelegation(job)).text;
-    } else text = failureNotice(job.status, job.deliveryManaged ? "delivery" : job.direct ? "direct" : "plain");
-    if (event !== "attention" && job.cleanupError) text = cleanupHoldNotice();
-    if (event !== "attention") text = finalizeUserNotice(text);
+      text = attentionNotice(job.id, job.message);
+    } else {
+      let review: { verdict?: string; summary?: string } | undefined;
+      let outcome: { interrupted?: boolean; holdProject?: boolean; record?: { targetReview?: { verdict?: string; summary?: string }; executionReview?: { verdict?: string; summary?: string } } } | undefined;
+      if (job.status === "completed" && !(job.cleanupPending && !job.closedAt)) {
+        if (job.deliveryManaged) {
+          outcome = await deliveryPipeline.run(job);
+          delegations.setDeliveryHold(job.id, Boolean(outcome.holdProject), outcome.holdProject ? "文件交付状态不确定，保留项目锁" : undefined);
+        } else review = await reviewDelegation(job);
+      }
+      const unsettled = Boolean(job.cleanupError) || Boolean(job.cleanupPending && !job.closedAt) || Boolean(outcome?.interrupted);
+      const picked = outcome?.record?.targetReview ?? outcome?.record?.executionReview;
+      const acceptance = unsettled
+        ? { verdict: "unverified", summary: "" }
+        : review
+          ? { verdict: review.verdict, summary: review.summary }
+          : picked
+            ? { verdict: picked.verdict, summary: picked.summary }
+            : undefined;
+      const note = unsettled
+        ? "收尾还没确认，不能把结果说成已经落稳"
+        : job.status === "completed"
+          ? ""
+          : "这次没有做完独立验收";
+      const guard = [JSON.stringify(job.report ?? ""), job.lastOutput];
+      let spoken = NOTICE_FALLBACK;
+      try {
+        spoken = await retellForUser({ task: job.task, status: job.status, report: job.report, acceptance, note }, guard);
+      } catch { spoken = NOTICE_FALLBACK; }
+      text = acceptUserCopy(spoken, guard);
+    }
     text = redactSensitive(text);
     notifications.put({ id, source: job.source, text: job.source.channel === "qq" ? text.slice(0, 3000) : text, kind: event === "attention" ? "attention" : "job" });
   }
@@ -659,9 +695,9 @@ async function handleDelegationEvent(job: DelegationJob, event: "terminal" | "at
   if (job.source.channel === "gui") notifications.ack(id);
 }
 
-async function reviewDelegation(job: DelegationJob): Promise<ReviewResult & { text: string }> { return evaluateDelegation(job); }
+async function reviewDelegation(job: DelegationJob): Promise<ReviewResult & { stage?: string; text: string }> { return evaluateDelegation(job); }
 
-async function evaluateDelegation(job: DelegationJob, options?: { stage: "execution" | "target"; record: DeliveryRecord; cwd: string }): Promise<ReviewResult & { text: string }> {
+async function evaluateDelegation(job: DelegationJob, options?: { stage: "execution" | "target"; record: DeliveryRecord; cwd: string }): Promise<ReviewResult & { stage?: string; text: string }> {
   const directory = path.join(root, "memory", "delegation-reviews");
   const suffix = options ? `-${options.stage}-${job.deliveryAttempt ?? 0}` : "";
   const file = path.join(directory, `${path.basename(job.id)}${suffix}.json`);
@@ -669,7 +705,8 @@ async function evaluateDelegation(job: DelegationJob, options?: { stage: "execut
   try {
     const saved = JSON.parse(readFileSync(file, "utf8"));
     if (saved.finishedAt === job.finishedAt && typeof saved.text === "string" && ["passed", "failed", "unverified"].includes(saved.verdict) && (saved.cacheKey === cacheKey || (!options && !saved.cacheKey))) {
-      return { verdict: saved.verdict, summary: saved.summary ?? saved.detail ?? saved.text, text: userNoticeFromReview({ verdict: saved.verdict, summary: typeof saved.summary === "string" ? saved.summary : "", task: job.task, stage: saved.stage ?? options?.stage }) };
+      const summary = typeof saved.summary === "string" ? saved.summary : "";
+      return { verdict: saved.verdict, summary, stage: typeof saved.stage === "string" ? saved.stage : options?.stage, text: summary };
     }
   } catch { /* 没有匹配当前基线和阶段的记录，执行一次独立验收。 */ }
   const prompt = [
@@ -704,12 +741,12 @@ async function evaluateDelegation(job: DelegationJob, options?: { stage: "execut
   const title = verdict === "passed" ? "验收通过" : verdict === "failed" ? "验收未通过" : "执行结束，尚未完成独立验收";
   const safeSummary = redactSensitive(summary);
   const detail = redactSensitive(`后台任务 ${job.id}：${title}。\n${summary}${checks.length ? "\n" + checks.map((check) => `- ${check}`).join("\n") : ""}`).slice(0, 6000);
-  const text = userNoticeFromReview({ verdict, summary: safeSummary, task: redactSensitive(job.task), stage: options?.stage });
+  const text = safeSummary;
   mkdirSync(directory, { recursive: true });
   const temporary = `${file}.tmp`;
   writeFileSync(temporary, JSON.stringify({ finishedAt: job.finishedAt, cacheKey, stage: options?.stage ?? "legacy", cwd: options?.cwd ?? job.cwd, verdict, summary: safeSummary, checks: checks.map((check) => redactSensitive(check)), detail, text, reviewedAt: new Date().toISOString(), tools: verificationTools, rawReply: redactSensitive(result.text).slice(0, 20000), error: result.error ? redactSensitive(result.error) : undefined }, null, 2));
   renameSync(temporary, file);
-  return { verdict, summary: safeSummary, text };
+  return { verdict, summary: safeSummary, stage: options?.stage, text };
 }
 
 let lastDeliveryError = "";
