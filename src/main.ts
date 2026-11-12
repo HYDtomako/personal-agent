@@ -3,6 +3,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, watchFile, writeFileSync } from "node:fs";
 import { loadConfig } from "./config.ts";
+import { captureChildOutput } from "./child-output.ts";
 import { PiRunner, type PiEvent } from "./runner.ts";
 import { MemoryStore } from "./memory.ts";
 import { NotionMemory, NotionMemoryCache } from "./notion-memory.ts";
@@ -128,7 +129,7 @@ const reviewRunner = new PiRunner({
   maxRepeatedToolFailures: config.agent?.maxRepeatedToolFailures,
 });
 
-/** 用一次无工具的 pi 调用执行纯文本任务（摘要、记忆合并）。 */
+/** 用一次无工具的 pi 调用执行纯文本任务（摘要、记忆合并）。stdout 按流式 UTF-8 解码，close 后才收尾。 */
 function runPiText(prompt: string, timeoutMs = 90_000): Promise<string> {
   const args = [
     ...config.pi.args,
@@ -147,16 +148,10 @@ function runPiText(prompt: string, timeoutMs = 90_000): Promise<string> {
       stdio: ["ignore", "pipe", "pipe"],
       env: { ...process.env, ...piEnv, PI_USER_ID: userId },
     });
-    let out = "";
     const timer = setTimeout(() => killTree(child.pid), timeoutMs);
-    child.stdout.on("data", (d: Buffer) => (out += d.toString("utf8")));
-    child.on("error", () => {
+    void captureChildOutput(child).then(({ stdout, code, error }) => {
       clearTimeout(timer);
-      resolve("");
-    });
-    child.on("exit", (code) => {
-      clearTimeout(timer);
-      resolve(code === 0 ? out.trim() : "");
+      resolve(!error && code === 0 ? stdout.trim() : "");
     });
   });
 }
@@ -247,7 +242,6 @@ async function summarizeSession(file: string): Promise<string> {
       stdio: ["ignore", "pipe", "pipe"],
       env: { ...process.env, ...piEnv, PI_USER_ID: userId },
     });
-    let out = "";
     const cleanup = () => {
       try {
         rmSync(sessionDir, { recursive: true, force: true });
@@ -256,16 +250,10 @@ async function summarizeSession(file: string): Promise<string> {
       }
     };
     const timer = setTimeout(() => killTree(child.pid), 180_000);
-    child.stdout.on("data", (d: Buffer) => (out += d.toString("utf8")));
-    child.on("error", () => {
+    void captureChildOutput(child).then(({ stdout, code, error }) => {
       clearTimeout(timer);
       cleanup();
-      resolve("");
-    });
-    child.on("exit", (code) => {
-      clearTimeout(timer);
-      cleanup();
-      resolve(code === 0 ? parseCompressOutput(out) : "");
+      resolve(!error && code === 0 ? parseCompressOutput(stdout) : "");
     });
   });
 }

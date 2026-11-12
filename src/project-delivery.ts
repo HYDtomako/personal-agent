@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { chmodSync, closeSync, copyFileSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { captureChildOutput } from "./child-output.ts";
 
 export interface ProjectIdentity {
   kind: "git" | "directory"; projectKey: string; targetRoot: string; targetCwd: string; relativeCwd: string;
@@ -128,11 +129,27 @@ export class ProjectDelivery {
       const env = { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0", GIT_LFS_SKIP_SMUDGE: "1" };
       for (const k of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"]) delete env[k];
       const child = spawn("git", ["-c", `core.hooksPath=${this.hooks}`, "-c", "core.quotePath=false", "-C", cwd, ...args], { env, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
-      let out = "", err = "", settled = false;
-      const done = (e?: Error, code?: number | null) => { if (settled) return; settled = true; clearTimeout(timer); if (e) reject(e); else if (!allowed.includes(code ?? -1)) reject(new Error(`Git ${args[0]} 失败：${err.slice(-1200)}`)); else resolve({ text: out, code: code ?? -1 }); };
+      let settled = false;
+      const done = (e?: Error, result?: { text: string; code: number }) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (e) reject(e);
+        else resolve(result!);
+      };
       const timer = setTimeout(() => { child.kill(); done(new Error(`Git ${args[0]} 超时`)); }, this.timeout);
-      child.stdout.on("data", d => { out += d.toString("utf8"); if (out.length > 32 * 1024 * 1024) { child.kill(); done(new Error("Git 输出超过上限")); } });
-      child.stderr.on("data", d => { err = (err + d).slice(-8000); }); child.on("error", e => done(e)); child.on("close", c => done(undefined, c));
+      const maxStdout = 32 * 1024 * 1024;
+      // quotePath=false 时中文路径按 UTF-8 原样输出，不能按块 toString。
+      void captureChildOutput(child, {
+        maxStdout,
+        maxStderr: 8000,
+        onStdoutLimit: () => { child.kill(); done(new Error("Git 输出超过上限")); },
+      }).then(({ stdout, stderr, code, error }) => {
+        if (stdout.length > maxStdout) { done(new Error("Git 输出超过上限")); return; }
+        if (error) { done(error); return; }
+        if (!allowed.includes(code ?? -1)) done(new Error(`Git ${args[0]} 失败：${stderr.slice(-1200)}`));
+        else done(undefined, { text: stdout, code: code ?? -1 });
+      });
     });
   }
   private async confirmIdentity(i: ProjectIdentity): Promise<void> {
