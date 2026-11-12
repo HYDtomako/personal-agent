@@ -786,7 +786,9 @@ function renderMessage(m, beforeRow = null) {
     row.appendChild(box);
   }
   const foot = [];
-  if (meta.durationMs) foot.push((meta.durationMs / 1000).toFixed(1) + 's');
+  if (Number.isFinite(meta.timings?.totalMs)) foot.push('总耗时 ' + (meta.timings.totalMs / 1000).toFixed(1) + 's');
+  else if (meta.durationMs) foot.push((meta.durationMs / 1000).toFixed(1) + 's');
+  if (Number.isFinite(meta.timings?.firstTextMs)) foot.push('首字 ' + (meta.timings.firstTextMs / 1000).toFixed(1) + 's');
   if (meta.tokens) foot.push(meta.tokens + ' tokens');
   if (meta.cost) foot.push('$' + meta.cost.toFixed(4));
   if (m.role === 'assistant' && m.via) foot.push(m.via);

@@ -473,6 +473,7 @@ const id = process.env.PI_REQUEST_ID;
 if (!id) throw new Error("fakePi requires PI_REQUEST_ID; this fixture only permits ordinary PA requests");
 appendFileSync(${JSON.stringify(callsFile)}, JSON.stringify({ requestId: id, cwd: process.cwd(), args: process.argv.slice(2), pid: process.pid }) + "\\n");
 const text = "fakePi echoed PI_REQUEST_ID=" + id;
+process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", usage: { input: 30, output: 12, totalTokens: 42, cost: { total: 0.0042 } } } }) + "\\n");
 process.stdout.write(JSON.stringify({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text }] }] }) + "\\n");
 `);
   // Keep production files byte-for-byte unchanged. A test-only import guard
@@ -537,6 +538,16 @@ syncBuiltinESMExports();
       const expectedReply = `fakePi echoed PI_REQUEST_ID=${accepted.id}`;
       assert.equal(completed.status, "completed", JSON.stringify(completed));
       assert.equal(completed.reply, expectedReply, "真实 runner 必须读懂 fakePi 的 agent_end JSONL");
+      assert(completed.meta.timings.totalMs >= completed.meta.timings.runMs);
+      assert(completed.meta.timings.firstTextMs >= 0);
+      assert.equal(completed.meta.metrics.modelCalls, 1);
+      assert(["events", "runner"].includes(completed.meta.metrics.source));
+      assert.equal(completed.meta.tokens, 42);
+      const traceFile = path.join(root, "data", "runtime-traces.jsonl");
+      const traces = jsonLines(traceFile);
+      assert.equal(traces.length, 1);
+      assert.equal(traces[0].requestId, accepted.id);
+      assert(!readFileSync(traceFile, "utf8").includes(input.text));
       assert.deepEqual(completed.source, source);
       await until(async () => expectStatus(await api(`/api/requests/${accepted.id}`), 200, "fixture settled request").request, (record) => Boolean(record.settledAt), "真实 main settledAt");
 

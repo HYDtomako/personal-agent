@@ -1,5 +1,7 @@
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
+import { RuntimeTraceStore, RunTraceObserver, measureAsync, measureSync, type RequestTimings, type TraceMetrics, type TraceUsage } from "./runtime-trace.ts";
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, watchFile, writeFileSync } from "node:fs";
 import { loadConfig } from "./config.ts";
@@ -86,6 +88,8 @@ const SECRETS = collectConfigSecrets(config, [deepseekKey, notionKey]);
 function redactSensitive(s: string): string {
   return redactText(s, SECRETS);
 }
+
+const runtimeTraces = new RuntimeTraceStore(path.join(root, "data", "runtime-traces.jsonl"), redactSensitive);
 
 const turnTimeoutMs = config.agent?.timeoutMs ?? 180_000;
 const delegationTimeoutMs = config.delegations?.timeoutMs ?? 3_600_000;
@@ -511,42 +515,49 @@ function submitConversation(input: ConversationInput): ConversationRequest {
 }
 
 async function handleRequest(request: ConversationRequest): Promise<ConversationResult> {
+  const started = performance.now();
+  const queueMs = Math.max(0, Date.parse(request.startedAt ?? new Date().toISOString()) - Date.parse(request.createdAt));
+  const timings: RequestTimings = { queueMs, sessionMs: 0, attachmentsMs: 0, memoryMs: 0, preparationMs: 0, runMs: 0, totalMs: 0 };
+  let executionStarted = false;
+  let outcome: { ok: boolean; metrics?: TraceMetrics; usage?: TraceUsage } = { ok: false };
+  const runModel = currentModelSpec();
+  runtimeTraces.begin(request.id);
   conversationActive = true;
   activeRequestId = request.id;
   server.broadcast("busy", { busy: true, requestId: request.id });
   const tools: Array<{ name: string; detail: string; isError?: boolean }> = [];
   try {
-    const { file, summary } = await memory.sessionFor(userId);
-    const ingest = request.uploadPaths.length ? await ingestUploads(request.uploadPaths, {
+    const { file, summary } = await measureAsync(timings, "sessionMs", () => memory.sessionFor(userId));
+    const ingest = request.uploadPaths.length ? await measureAsync(timings, "attachmentsMs", () => ingestUploads(request.uploadPaths, {
       dir: uploadDir, log, maxTextChars: config.files?.maxTextChars,
       maxTotalChars: config.files?.maxTotalChars, pdftotext: config.files?.pdftotext,
-    }) : { attach: [], notes: [], rejected: [] };
+    })) : { attach: [], notes: [], rejected: [] };
     let memoryLines: string[] = [];
     let memoryIndex = "";
     let memoryTotal = 0;
     let memorySource = "Notion 权威";
     try {
       if (notionCache && notionMemory) {
-        const loaded = await notionCache.load();
-        memoryIndex = await notionMemory.indexText();
-        const sel = notionMemory.select(loaded.entries, request.text, {
+        const loaded = await measureAsync(timings, "memoryMs", () => notionCache.load());
+        memoryIndex = await measureAsync(timings, "memoryMs", () => notionMemory.indexText());
+        const sel = measureSync(timings, "memoryMs", () => notionMemory.select(loaded.entries, request.text, {
           maxInjectChars: config.memory?.maxInjectChars,
           minRelevanceScore: config.memory?.minRelevanceScore,
           indexText: memoryIndex,
-        });
+        }));
         memoryLines = sel.lines;
         memoryTotal = sel.total;
         memorySource = loaded.label;
         log(`[memory] ${loaded.label} 注入 ${memoryLines.length}/${memoryTotal} 条，目录 ${sel.index.length} 字${loaded.stale ? "（stale，本轮刷新失败）" : ""}`);
       } else {
-        const sel = memory.select(userId, request.text);
+        const sel = measureSync(timings, "memoryMs", () => memory.select(userId, request.text));
         memoryLines = sel.lines.map((line) => `- [archive] ${line.replace(/^- /, "")}`);
         memoryTotal = sel.total;
         memorySource = "本地归档（Notion 未配置）";
       }
     } catch (error) {
       log("[memory] Notion 实时与快照均不可用，降级到本地冻结归档:", error instanceof Error ? error.message : error);
-      const sel = memory.select(userId, request.text);
+      const sel = measureSync(timings, "memoryMs", () => memory.select(userId, request.text));
       memoryLines = sel.lines.map((line) => `- [archive] ${line.replace(/^- /, "")}`);
       memoryTotal = sel.total;
       memorySource = "本地归档兜底（Notion 不可用）";
@@ -561,10 +572,14 @@ async function handleRequest(request: ConversationRequest): Promise<Conversation
     background.push("[系统执行约定] 编码任务通过 agent_dispatch 提交后结束当前轮，不循环等待；后台独立执行并验收。你的本轮最终答复由主服务自动发送到原渠道，不要使用 qq_send 重复回执。");
     const prompt = buildPrompt(request.text, ingest.notes, ingest.rejected) + `\n\n${background.join("\n\n")}`;
     let streamed = "";
+    timings.preparationMs = performance.now() - started;
+    executionStarted = true;
+    const observer = new RunTraceObserver();
     const result = await runner.run(prompt, {
-      model: currentModelSpec(), sessionFile: file, attachPaths: ingest.attach, userId,
+      model: runModel, sessionFile: file, attachPaths: ingest.attach, userId,
       env: { PI_REQUEST_ID: request.id, PI_REQUEST_TEXT: request.text },
       onEvent: (event: PiEvent) => {
+        observer.observe(event);
         if (event.kind === "delta") {
           streamed += event.text;
           server.broadcast("delta", { text: event.text, requestId: request.id });
@@ -578,18 +593,34 @@ async function handleRequest(request: ConversationRequest): Promise<Conversation
         }
       },
     });
+    const observed = observer.finish(result);
+    outcome = { ok: result.ok, metrics: observed.metrics, usage: observed.usage };
+    timings.runMs = result.durationMs;
+    timings.runnerQueueMs = observed.metrics.queueMs;
+    timings.totalMs = queueMs + performance.now() - started;
+    if (observed.firstTextAfterSubmitMs !== undefined) timings.firstTextMs = queueMs + timings.preparationMs + observed.firstTextAfterSubmitMs;
+    const contextSnapshot = runtimeTraces.contextFor(request.id);
+    timings.contextMs = contextSnapshot?.durationMs;
     const ownJobs = delegations.list().filter((job) => job.requestId === request.id);
     const { text, images } = resolveImages(redactSensitive(result.text || streamed));
     const error = !result.ok ? redactSensitive(result.error || "PA 本轮未正常结束") : undefined;
     let reply = text || (ownJobs.length ? `已接收后台任务：${ownJobs.map((job) => job.id).join("、")}。完成或失败会自动回报，你可以继续聊天。` : "（本轮没有输出）");
     if (error) reply += `\n\n（${error}${ownJobs.length ? "；已派发的后台任务不受本轮超时影响" : ""}）`;
     log(`[run] request=${request.id} ok=${result.ok} ${result.durationMs}ms 工具 ${tools.length} 个`);
-    return { reply, error, meta: { requestId: request.id, durationMs: result.durationMs, tokens: result.usage?.tokens, cost: result.usage?.cost, error, tools, ...(images.length ? { images } : {}) } };
+    return { reply, error, meta: { requestId: request.id, durationMs: result.durationMs, timings, metrics: observed.metrics, context: contextSnapshot?.stats, tokens: observed.usage?.tokens, cost: observed.usage?.cost, error, tools, ...(images.length ? { images } : {}) } };
   } catch (error) {
+    outcome = { ...outcome, ok: false };
     const message = redactSensitive(error instanceof Error ? error.message : String(error));
     log("[main] 处理异常:", message);
-    return { reply: `（本轮处理失败：${message}）`, error: message, meta: { requestId: request.id, error: message } };
+    return { reply: `（本轮处理失败：${message}）`, error: message, meta: { requestId: request.id, error: message, timings } };
   } finally {
+    if (!executionStarted) timings.preparationMs = performance.now() - started;
+    timings.totalMs = queueMs + performance.now() - started;
+    const contextSnapshot = runtimeTraces.contextFor(request.id);
+    timings.contextMs = contextSnapshot?.durationMs;
+    try { runtimeTraces.append({ requestId: request.id, at: new Date().toISOString(), model: runModel ?? "default", ok: outcome.ok, timings, metrics: outcome.metrics, usage: outcome.usage, context: contextSnapshot?.stats }); }
+    catch (error) { log("[trace] 诊断记录写入失败（不影响请求结果）:", errText(error)); }
+    finally { runtimeTraces.end(request.id); }
     conversationActive = false;
     activeRequestId = undefined;
     server.broadcast("busy", { busy: false, requestId: request.id });

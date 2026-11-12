@@ -29,6 +29,9 @@
     "smoke": "node scripts/smoke.ts",
     "selftest:docparse": "node scripts/docparse-selftest.ts",
     "selftest:video": "node scripts/video-selftest.ts",
-    "video:subtitle": "node scripts/video-subtitle.ts"
+    "video:subtitle": "node scripts/video-subtitle.ts",
+    "selftest:diagnostics": "node --test scripts/diagnostics-selftest.mjs",
+    "diagnostics": "node scripts/runtime-diagnostics.mjs",
+    "test": "node scripts/offline-regression.mjs"
   }
 }
