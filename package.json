@@ -16,6 +16,7 @@
     "selftest:delegate": "node scripts/delegate-selftest.mjs",
     "selftest:delegations": "node scripts/delegations-selftest.mjs",
     "selftest:requests": "node scripts/requests-selftest.mjs",
+    "selftest:server-security": "node --test scripts/server-security-selftest.mjs",
     "selftest:notion-cache": "node scripts/notion-memory-cache-selftest.mjs",
     "selftest:telegram": "node --test scripts/telegram-selftest.mjs",
     "selftest:background": "node scripts/background-selftest.mjs",
@@ -29,6 +30,8 @@
     "smoke": "node scripts/smoke.ts",
     "selftest:docparse": "node scripts/docparse-selftest.ts",
     "selftest:video": "node scripts/video-selftest.ts",
-    "video:subtitle": "node scripts/video-subtitle.ts"
+    "video:subtitle": "node scripts/video-subtitle.ts",
+    "selftest:runner": "node --test scripts/runner-selftest.mjs",
+    "selftest:utf8-child": "node --test scripts/utf8-child-selftest.mjs"
   }
 }

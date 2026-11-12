@@ -97,7 +97,7 @@ PA 的对话轮次与 CA 编码任务现在分开运行。`agent_dispatch` 只�
 
 执行器自身的首次目录 Trust 门独立于自动参数。PA 仅在实际弹框目录与本任务 cwd 精确相符、且启动前及确认前都未发现项目 MCP 配置文件时自动确认；每次后续启动仍会重新检查。有项目 MCP 文件、Git 根无法确认或配置不可读时拒绝自动启用并明确报告。这个原生目录信任会持久化，不绑定 MCP 内容；在终端里手工启动执行器不经过 PA 的前置检查，仍遵循该执行器自己的信任语义。用户级 MCP 配置未修改。
 
-后台任务记录在 `memory/delegations.json`，CA 结果报告在 `memory/delegation-results/`，独立验收记录在 `memory/delegation-reviews/`。`completed` 只代表 CA 提交了完成报告；系统再核对实际文件与测试，无法核实会明确显示尚未验收，不能把接收或执行结束当成成功。
+后台任务记录在 `memory/delegations.json`，CA 结果报告在 `memory/delegation-results/`，独立验收记录在 `memory/delegation-reviews/`。每个任务的状态变化按行追加到 `memory/delegation-trace/<任务id>.jsonl`（单任务 2 MiB 上限），用于排查失联、接管和验收阶段；输出快照不写进轨迹。`completed` 只代表 CA 提交了完成报告；系统再核对实际文件与测试，无法核实会明确显示尚未验收，不能把接收或执行结束当成成功。
 
 所有聊天入口共用短轮次队列，避免并发写同一个模型会话。请求存于 `memory/requests.json`；重启时原 running 对话标记中断而不是盲目重跑，已派发的 CA 独立恢复监管。后台会核对 herdr terminal/session 身份；如果 herdr 自身重启导致终端替换，报告中断，不假装原任务仍在运行，也不自动重复编码。
 
@@ -153,8 +153,10 @@ node scripts/delivery-live-selftest.mjs --send
 
 - **使用者身份经环境变量注入**（`PI_USER_ID`）。旧做法是让模型从消息里抄一个"我是谁"，那是个能被注入骗过的字段；现在模型改不了自己是谁。
 - **页面只监听 127.0.0.1**。要让手机也能连，`gui.host` 改 `0.0.0.0` 时必须设 `gui.token`——不设会被启动检查直接拦下，因为那等于把有 shell 权限的 agent 开放给整个网段。
-- **图片/文件只从 workspace 里读**：`/api/file` 做了路径穿越检查（`../config.json` 一律 404）。
+- **图片/文件只从 workspace 里读**：`/api/file` 同时校验请求路径与解析符号链接/Windows 目录联接后的真实路径（`../config.json` 和指向 workspace 外的链接一律 404）。
 - **输出统一脱敏**：配置里的密钥值（含 `telegram.token`、带账号密码的 `telegram.proxy`）、`sk-`/`tvly-`/`Bearer` 形态、Telegram bot token 形态、百炼实例域名都不会出现在页面和日志里。
+
+HTTP JSON 与 SSE（包括首次状态、工具结果及后台通知）共用脱敏出口。流式回复按请求保留尚未结束的 token 和配置密钥前缀，跨文本块的密钥也不会直接推到页面；停止或结束时发送剩余的已脱敏文本，新对话丢弃旧缓冲。
 
 ## 目录
 
@@ -234,6 +236,7 @@ pa 会自行调用 `video_subtitle` 读取平台已有字幕，再在当前对�
 npm run selftest:delegate
 npm run selftest:delegations
 npm run selftest:requests
+npm run selftest:server-security # 本地 HTTP/SSE 脱敏、跨块密钥及真实路径边界
 npm run selftest:telegram
 npm run selftest:runner-background
 npm run selftest:background  # 真实本地 HTTP + 隔离主程序，模型与 CA 为 fixture
@@ -249,6 +252,16 @@ npm run selftest:app         # 隔离的单实例、重启、端口冲突与项�
 ```bash
 node scripts/docparse-selftest.ts [-v] 文件1 文件2 ...
 ```
+
+## 执行器可靠性与执行预算
+
+执行器按 UTF-8 流解码 pi 的 JSONL，在 stdout/stderr 结束后完成本轮，并处理末行没有换行的事件。本轮全部模型调用的 Token、费用及缓存用量累加，工具结果按调用 ID 关联。
+
+config.agent.maxToolCalls 默认 100，观察到超额工具启动事件时停止本轮；maxRepeatedToolFailures 默认 5，只有同一工具、规范化参数和失败结果连续相同时触发。两项都支持 0 关闭；旧配置使用默认值。参数或结果变化以及成功操作会重置连续失败计数。
+
+工具启动事件到达时，动作可能已经开始；保护控制后续循环，外部动作仍需授权与幂等校验。取消、超时和预算停止不自动重放工具，等待进程真实关闭后释放槽位；后台 CA 独立运行。
+
+运行 npm run selftest:runner 检查事件回放与假 pi 子进程，运行 npm run selftest:runner-background 检查请求身份、独立验收环境和超时恢复；均不调用真实模型。
 
 ## 一些取舍
 

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import {
-  closeSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync,
+  appendFileSync, closeSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync,
   readFileSync, readSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync,
 } from "node:fs";
 import path from "node:path";
@@ -12,6 +12,8 @@ import type { DeliveryRecord, ProjectIdentity } from "./project-delivery.ts";
 export type DelegationStatus = "queued" | "starting" | "running" | "needs_attention" | "completed" | "failed" | "timed_out" | "cancelled";
 export interface DelegationReport {
   jobId: string;
+  /** Execution generation the CA was launched with; stale generations are rejected. */
+  generation?: number;
   status: "completed" | "failed";
   summary: string;
   tests?: unknown;
@@ -41,6 +43,11 @@ export interface DelegationJob {
   source: ReplySource;
   requestId?: string;
   status: DelegationStatus;
+  /** Increments only when a replacement executor takes over; fences stale reports. */
+  generation: number;
+  /** 通信状态，与执行状态分开：poll 暂时失败不等于任务失败。 */
+  liveness?: "unknown" | "live" | "suspect" | "lost";
+  livenessAt?: string;
   timeoutMs: number;
   createdAt: string;
   startedAt?: string;
@@ -94,6 +101,8 @@ export interface DelegationManagerOptions {
   pollIntervalMs?: number;
   startupTimeoutMs?: number;
   onEvent?: (job: DelegationJob, event: "terminal" | "attention") => Promise<void>;
+  /** 追加执行轨迹的目录；默认在任务存储同级的 delegation-trace/。 */
+  traceDir?: string;
   log?: (...args: unknown[]) => void;
   now?: () => number;
 }
@@ -111,6 +120,8 @@ const DELIVERY_RETRY_WINDOW_MS = 24 * 60 * 60_000;
 const MAX_DELIVERY_ATTEMPTS = 2;
 /** Only recent, still-actionable terminal jobs are shown as background context. */
 const BACKGROUND_TERMINAL_WINDOW_MS = 24 * 60 * 60_000;
+/** Per-job append-only trace cap. State changes are small; this is only a runaway guard. */
+const TRACE_LIMIT = 2 * 1024 * 1024;
 
 function errorText(error: unknown): string { return (error instanceof Error ? error.message : String(error)).slice(-3000); }
 function positive(value: number | undefined, fallback: number, name: string): number {
@@ -172,6 +183,7 @@ function canonical(cwd: string): { cwd: string; key: string } {
 export class DelegationManager {
   private readonly file: string;
   private readonly resultsDir: string;
+  private readonly traceDir: string;
   private readonly adapter: HerdrAdapterLike;
   private readonly delivery?: DelegationManagerOptions["delivery"];
   private readonly deliveryMode: "direct" | "worktree";
@@ -197,11 +209,13 @@ export class DelegationManager {
   private notifications = new Map<string, symbol>();
   private terminalCallbacks = new Set<string>();
   private notificationAttempts = new Map<string, number>();
+  private traceCapped = new Set<string>();
   private storageError?: Error;
 
   constructor(opts: DelegationManagerOptions) {
     this.file = path.resolve(opts.file);
     this.resultsDir = path.resolve(opts.resultsDir);
+    this.traceDir = opts.traceDir ? path.resolve(opts.traceDir) : path.join(path.dirname(this.file), "delegation-trace");
     this.adapter = opts.adapter ?? new HerdrAdapter();
     this.delivery = opts.delivery;
     this.deliveryMode = opts.deliveryMode ?? "worktree";
@@ -271,12 +285,13 @@ export class DelegationManager {
       ...(projectIdentity ? { projectIdentity, projectKey: projectIdentity.projectKey } : {}),
       ...(direct ? { direct: true, executionCwd: location.cwd } : { deliveryManaged: true, deliveryAttempt: 0 }),
       source: copy(context.source), ...(requestId === undefined ? {} : { requestId }),
-      status: "queued", timeoutMs, createdAt: iso(this.now()),
+      status: "queued", generation: 1, liveness: "unknown", timeoutMs, createdAt: iso(this.now()),
       reportPath: path.join(this.resultsDir, `${id}.json`), lastOutput: "",
       message: direct ? "已持久化排队；CA 将直接在原项目修改，不创建隔离树。" : "已持久化排队；后台派发，不等待 CA 执行。",
     };
     mkdirSync(this.resultsDir, { recursive: true });
     this.commit(job);
+    this.trace(job, "created", { status: job.status, direct: Boolean(job.direct), worker: job.worker });
     this.kick();
     return copy(job);
   }
@@ -438,6 +453,10 @@ export class DelegationManager {
           if (typeof (job as any)[key] !== "string" || !(job as any)[key]) throw new Error(`任务缺少 ${key}`);
         }
         if (!/^ca-[0-9a-f-]{36}$/.test(job.id) || !STATUSES.has(job.status) || typeof job.lastOutput !== "string" || job.lastOutput.length > OUTPUT_LIMIT) throw new Error("任务标识、状态或输出快照无效");
+        // 旧存储没有 generation：按第一代读入，之后只允许更大代次接管。
+        if (job.generation === undefined) job.generation = 1;
+        if (!Number.isSafeInteger(job.generation) || job.generation < 1) throw new Error("任务 generation 无效");
+        if (job.liveness !== undefined && !["unknown", "live", "suspect", "lost"].includes(job.liveness)) throw new Error("任务 liveness 无效");
         if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(job.name) || !/^[a-z0-9][a-z0-9_-]{0,39}$/.test(job.worker) || job.task.length > 100_000) throw new Error("任务名称、worker或描述无效");
         if (!path.isAbsolute(job.cwd) || !path.isAbsolute(job.canonicalCwd)) throw new Error("任务目录无效");
         for (const key of ["direct", "deliveryManaged", "deliveryHold"] as const) {
@@ -506,8 +525,53 @@ export class DelegationManager {
   private update(id: string, patch: Partial<DelegationJob>): DelegationJob {
     const current = this.jobs.get(id)!;
     const next = { ...current, ...patch };
-    if (JSON.stringify(current) !== JSON.stringify(next)) this.commit(next);
+    if (JSON.stringify(current) !== JSON.stringify(next)) {
+      this.commit(next);
+      this.traceState(current, next, patch);
+    }
     return this.jobs.get(id)!;
+  }
+
+  /** 状态变化写一条轨迹；只记录变化字段，不把整份输出快照落盘。 */
+  private traceState(before: DelegationJob, after: DelegationJob, patch: Partial<DelegationJob>): void {
+    const changed = Object.keys(patch).filter((key) =>
+      key !== "lastOutput" && JSON.stringify((before as any)[key]) !== JSON.stringify((after as any)[key]),
+    );
+    if (!changed.length) return;
+    const detail: Record<string, unknown> = { status: after.status, changes: changed };
+    if (changed.includes("status")) detail.fromStatus = before.status;
+    if (changed.includes("launchPhase") && after.launchPhase) detail.launchPhase = after.launchPhase;
+    if (changed.includes("message") && after.message) detail.message = after.message.slice(0, 500);
+    if (changed.includes("reportIssue") && after.reportIssue) detail.reportIssue = after.reportIssue.slice(0, 500);
+    if (changed.includes("attentionReason") && after.attentionReason) detail.attentionReason = after.attentionReason;
+    if (changed.includes("liveness") && after.liveness) detail.liveness = after.liveness;
+    if (changed.includes("monitorError") && after.monitorError) detail.monitorError = after.monitorError.slice(0, 500);
+    if (changed.includes("cleanupError") && after.cleanupError) detail.cleanupError = after.cleanupError.slice(0, 500);
+    this.trace(after, "state", detail);
+  }
+
+  /** 追加一条 JSONL；轨迹失败只记日志，绝不影响任务监管。 */
+  private trace(job: DelegationJob, event: string, detail: Record<string, unknown> = {}): void {
+    try {
+      if (this.traceCapped.has(job.id)) return;
+      const file = path.join(this.traceDir, `${job.id}.jsonl`);
+      if (existsSync(file) && statSync(file).size >= TRACE_LIMIT) {
+        appendFileSync(file, JSON.stringify({ at: iso(this.now()), job: job.id, event: "trace_capped" }) + "\n", "utf8");
+        this.traceCapped.add(job.id);
+        return;
+      }
+      mkdirSync(this.traceDir, { recursive: true });
+      appendFileSync(file, JSON.stringify({ at: iso(this.now()), job: job.id, event, ...detail }) + "\n", "utf8");
+    } catch (error) {
+      this.log("[delegations] trace", job.id, errorText(error));
+    }
+  }
+
+  /** 只在通信状态真正变化时写盘，避免每 5 秒一次空更新。 */
+  private setLiveness(id: string, liveness: NonNullable<DelegationJob["liveness"]>, now: number): DelegationJob {
+    const current = this.jobs.get(id)!;
+    if (current.liveness === liveness) return current;
+    return this.update(id, { liveness, livenessAt: iso(now) });
   }
   private kick(): void {
     if (!this.running || this.scheduled) return;
@@ -703,7 +767,8 @@ export class DelegationManager {
       : !job.deliveryManaged ? "" : `不要自行 commit/push/stash/reset/merge 或删除工作树；PA 会独立验收、回写原项目、目标复验并清理磁盘工作树。herdr 终端关闭不等同于磁盘工作树清理。\n`;
     return `${job.task}\n\n${files}${delivery}[后台任务结果报告约定]\n任务 ID：${job.id}\n` +
       `最后一步将 UTF-8 JSON 写入此绝对路径（可先写临时文件再原子重命名）：${job.reportPath}\n` +
-      `格式：${JSON.stringify({ jobId: job.id, status: "completed", summary: "本轮实际结果与未完成项", tests: [], changedFiles: [] })}\n` +
+      `格式：${JSON.stringify({ jobId: job.id, generation: job.generation, status: "completed", summary: "本轮实际结果与未完成项", tests: [], changedFiles: [] })}\n` +
+      `generation 必须等于 ${job.generation}；代次不符的报告会被拒绝（来自旧执行者）。\n` +
       `status 只能是 completed 或 failed；无法完成也必须写 failed 及真实原因。summary 必须是字符串。` +
       `tests 可列实际执行的命令及结果，changedFiles 可列改动路径，不得虚构验证。报告不超过 64 KiB。` +
       `此文件只是 CA 自述，主线程另行独立验收。写报告后不要继续修改项目。除任务必需信息外，不读取或写入个人记忆、凭据或密钥。\n` +
@@ -728,7 +793,11 @@ export class DelegationManager {
       if (length > REPORT_LIMIT) throw new Error("报告超过 64 KiB 上限");
       const report = JSON.parse(bytes.subarray(0, length).toString("utf8"));
       if (!report || report.jobId !== job.id || !["completed", "failed"].includes(report.status) || typeof report.summary !== "string" || !report.summary.trim()) throw new Error("报告 jobId/status/summary 无效或不匹配");
-      return { jobId: job.id, status: report.status, summary: report.summary, ...(report.tests === undefined ? {} : { tests: report.tests }), ...(report.changedFiles === undefined ? {} : { changedFiles: report.changedFiles }) };
+      if (report.generation !== undefined && (!Number.isSafeInteger(report.generation) || report.generation < 1)) throw new Error("报告 generation 无效");
+      // 第 1 代兼容升级前未带 generation 的旧报告；一旦发生接管，只认当前代次。
+      if (report.generation === undefined && job.generation > 1) throw new Error(`报告缺少 generation；当前已是第 ${job.generation} 代，拒绝旧格式报告`);
+      if (report.generation !== undefined && report.generation !== job.generation) throw new Error(`报告 generation=${report.generation} 与当前执行代次 ${job.generation} 不符；已拒绝旧执行者提交`);
+      return { jobId: job.id, generation: job.generation, status: report.status, summary: report.summary, ...(report.tests === undefined ? {} : { tests: report.tests }), ...(report.changedFiles === undefined ? {} : { changedFiles: report.changedFiles }) };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") this.update(job.id, { reportIssue: errorText(error) });
       return undefined;
@@ -749,18 +818,21 @@ export class DelegationManager {
       if (agent) {
         const mismatch = this.identityMismatch(current, agent);
         if (mismatch) {
+          this.setLiveness(id, "lost", now);
           this.update(id, { cleanupBlocked: true, cleanupError: mismatch });
           this.finish(id, "failed", `interrupted：${mismatch}；不重新投递，也不关闭可能已被替换的终端。`);
           return;
         }
         if (current.terminalId === undefined) {
           // A recorded pane without a recorded terminal cannot prove that herdr survived a restart.
+          this.setLiveness(id, "suspect", now);
           this.attention(id, "identity", "缺少原 terminal_id，无法证明仍是原 CA；不重派，保留项目锁供人工处理。");
           return;
         }
         const session = this.sessionIdentity(agent.agent_session);
         if (session) current = this.update(id, { agentSession: { ...session, ...current.agentSession } });
         this.identityValidated.set(id, epoch);
+        current = this.setLiveness(id, "live", now);
       }
       let progressed = false;
       if (output.status === "fulfilled") {
@@ -780,7 +852,9 @@ export class DelegationManager {
       if (!agent) {
         const reason = listed.status === "rejected" ? `herdr 查询暂不可用：${errorText(listed.reason)}` : "当前 agent 列表暂未找到持久化 pane；不会重新投递";
         current = this.update(id, { monitorError: reason, unavailableSince: current.unavailableSince ?? iso(now), missingReportSince: undefined });
-        if (now - Date.parse(current.unavailableSince!) >= Math.max(60_000, this.pollIntervalMs * 2) && now - Date.parse(current.lastProgressAt!) >= QUIET_BLOCKED_MS) this.attention(id, "unavailable", `${reason}；保留监管及总 deadline。`);
+        const lost = now - Date.parse(current.unavailableSince!) >= Math.max(60_000, this.pollIntervalMs * 2);
+        current = this.setLiveness(id, lost ? "lost" : "suspect", now);
+        if (lost && now - Date.parse(current.lastProgressAt!) >= QUIET_BLOCKED_MS) this.attention(id, "unavailable", `${reason}；保留监管及总 deadline。`);
         return;
       }
       current = this.update(id, { monitorError: output.status === "rejected" ? `终端快照暂不可读：${errorText(output.reason)}` : undefined, unavailableSince: undefined });
@@ -857,6 +931,11 @@ export class DelegationManager {
     this.update(id, {
       status, message, finishedAt: iso(this.now()), ...(report ? { report, reportIssue: undefined } : {}),
       cleanupPending: Boolean(job.workspaceId || this.launches.has(id)),
+    });
+    this.trace(this.jobs.get(id)!, "terminal", {
+      status,
+      message: message.slice(0, 500),
+      ...(report ? { reportStatus: report.status } : {}),
     });
     this.notify(this.jobs.get(id)!, "terminal");
     void this.cleanup(id).catch((error) => this.log("[delegations] cleanup", errorText(error)));
