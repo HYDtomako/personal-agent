@@ -1,8 +1,9 @@
-import { createReadStream, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, createReadStream, existsSync, fstatSync, mkdirSync, openSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
 import path from "node:path";
 import type { ConversationInput } from "./requests.ts";
 import { normalizeSource, type ReplySource } from "./protocol.ts";
+import { StreamingRedactor } from "./redact.ts";
 
 interface DelegationAPI {
   submit: (input: Record<string, unknown>) => unknown;
@@ -54,12 +55,24 @@ export interface ServerDeps {
     ack: (id: string) => boolean;
   };
   redact?: (text: string) => string;
+  /** 跨文本块匹配所需的配置密钥，仅在服务端保存。 */
+  redactSecrets?: readonly string[];
 }
 
 const MAX_BODY = 64 * 1024 * 1024; // 上传上限 64MB
 
+function insideDirectory(root: string, file: string): boolean {
+  const relative = path.relative(root, file);
+  return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
+
 export class GuiServer {
   private readonly clients = new Set<ServerResponse>();
+  private readonly streams = new Map<string, { redactor: StreamingRedactor; data: Record<string, unknown> }>();
   private readonly deps: ServerDeps;
   private http?: Server;
 
@@ -69,7 +82,34 @@ export class GuiServer {
 
   /** 推给所有打开的页面（SSE）。 */
   broadcast(event: string, data: unknown): void {
-    const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    const value = record(data);
+    const requestId = value?.requestId ?? record(value?.meta)?.requestId;
+    const key = typeof requestId === "string" ? requestId : "";
+    if (event === "reset") this.streams.clear();
+    if (event === "delta" && typeof value?.text === "string" && this.deps.redact) {
+      let stream = this.streams.get(key);
+      if (!stream) {
+        stream = { redactor: new StreamingRedactor(this.deps.redact, this.deps.redactSecrets), data: value };
+        this.streams.set(key, stream);
+      }
+      stream.data = value;
+      const text = stream.redactor.push(value.text);
+      if (text) this.emit(event, { ...value, text });
+      return;
+    }
+    if (event === "done" || (event === "busy" && value?.busy === false)) {
+      const stream = this.streams.get(key);
+      if (stream) {
+        this.streams.delete(key);
+        const text = stream.redactor.end();
+        if (text) this.emit("delta", { ...stream.data, text });
+      }
+    }
+    this.emit(event, data);
+  }
+
+  private emit(event: string, data: unknown): void {
+    const payload = this.eventPayload(event, data);
     for (const res of this.clients) {
       try {
         res.write(payload);
@@ -77,6 +117,18 @@ export class GuiServer {
         this.clients.delete(res);
       }
     }
+  }
+
+  private eventPayload(event: string, data: unknown): string {
+    return `event: ${event}\ndata: ${this.serialize(data)}\n\n`;
+  }
+
+  /** 对 JSON 字符串逐项解码、脱敏再编码，兼容密钥里的引号、反斜杠和换行。 */
+  private serialize(data: unknown): string {
+    const body = JSON.stringify(data);
+    return this.deps.redact
+      ? body.replace(/"(?:[^"\\]|\\.)*"/g, (encoded) => JSON.stringify(this.deps.redact!(JSON.parse(encoded))))
+      : body;
   }
 
   listen(): Promise<void> {
@@ -103,6 +155,7 @@ export class GuiServer {
   }
 
   close(): Promise<void> {
+    this.streams.clear();
     for (const response of this.clients) response.end();
     this.clients.clear();
     return new Promise((resolve, reject) => {
@@ -190,8 +243,7 @@ export class GuiServer {
 
   private json(res: ServerResponse, data: unknown, status = 200): void {
     res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-    const body = JSON.stringify(data);
-    res.end(this.deps.redact ? this.deps.redact(body) : body);
+    res.end(this.serialize(data));
   }
 
   private async readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
@@ -302,9 +354,21 @@ export class GuiServer {
   /** 只允许读 workspace 内的文件（agent 的产出、上传的图片）。 */
   private serveWorkspaceFile(res: ServerResponse, url: URL): void {
     const rel = url.searchParams.get("p") ?? "";
-    const abs = path.resolve(this.deps.workspace, rel);
-    const rootWithSep = this.deps.workspace.endsWith(path.sep) ? this.deps.workspace : this.deps.workspace + path.sep;
-    if (!abs.startsWith(rootWithSep) || !existsSync(abs) || !statSync(abs).isFile()) {
+    const root = path.resolve(this.deps.workspace);
+    const abs = path.resolve(root, rel);
+    let file: string;
+    let fd: number | undefined;
+    try {
+      if (!insideDirectory(root, abs)) throw new Error("路径越界");
+      const realRoot = realpathSync.native(root);
+      file = realpathSync.native(abs);
+      if (!insideDirectory(realRoot, file)) throw new Error("真实路径越界");
+      if (!statSync(file).isFile()) throw new Error("不是普通文件");
+      // 打开解析后的真实路径，后续流复用此句柄，不重新跟随原始链接。
+      fd = openSync(file, "r");
+      if (!fstatSync(fd).isFile()) throw new Error("不是普通文件");
+    } catch {
+      if (fd !== undefined) closeSync(fd);
       res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
       res.end("文件不存在");
       return;
@@ -321,7 +385,10 @@ export class GuiServer {
       : ext === ".md" || ext === ".txt" ? "text/plain; charset=utf-8"
       : "application/octet-stream";
     res.writeHead(200, { "content-type": type, "cache-control": "no-store" });
-    createReadStream(abs).pipe(res);
+    const stream = createReadStream(file, { fd, autoClose: true });
+    stream.on("error", () => res.destroy());
+    res.on("close", () => stream.destroy());
+    stream.pipe(res);
   }
 
   private sse(req: IncomingMessage, res: ServerResponse): void {
@@ -330,7 +397,7 @@ export class GuiServer {
       "cache-control": "no-store",
       connection: "keep-alive",
     });
-    res.write(`event: status\ndata: ${JSON.stringify(this.deps.status())}\n\n`);
+    res.write(this.eventPayload("status", this.deps.status()));
     this.clients.add(res);
     const ping = setInterval(() => {
       try {

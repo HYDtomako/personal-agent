@@ -153,8 +153,10 @@ node scripts/delivery-live-selftest.mjs --send
 
 - **使用者身份经环境变量注入**（`PI_USER_ID`）。旧做法是让模型从消息里抄一个"我是谁"，那是个能被注入骗过的字段；现在模型改不了自己是谁。
 - **页面只监听 127.0.0.1**。要让手机也能连，`gui.host` 改 `0.0.0.0` 时必须设 `gui.token`——不设会被启动检查直接拦下，因为那等于把有 shell 权限的 agent 开放给整个网段。
-- **图片/文件只从 workspace 里读**：`/api/file` 做了路径穿越检查（`../config.json` 一律 404）。
+- **图片/文件只从 workspace 里读**：`/api/file` 同时校验请求路径与解析符号链接/Windows 目录联接后的真实路径（`../config.json` 和指向 workspace 外的链接一律 404）。
 - **输出统一脱敏**：配置里的密钥值（含 `telegram.token`、带账号密码的 `telegram.proxy`）、`sk-`/`tvly-`/`Bearer` 形态、Telegram bot token 形态、百炼实例域名都不会出现在页面和日志里。
+
+HTTP JSON 与 SSE（包括首次状态、工具结果及后台通知）共用脱敏出口。流式回复按请求保留尚未结束的 token 和配置密钥前缀，跨文本块的密钥也不会直接推到页面；停止或结束时发送剩余的已脱敏文本，新对话丢弃旧缓冲。
 
 ## 目录
 
@@ -234,6 +236,7 @@ pa 会自行调用 `video_subtitle` 读取平台已有字幕，再在当前对�
 npm run selftest:delegate
 npm run selftest:delegations
 npm run selftest:requests
+npm run selftest:server-security # 本地 HTTP/SSE 脱敏、跨块密钥及真实路径边界
 npm run selftest:telegram
 npm run selftest:runner-background
 npm run selftest:background  # 真实本地 HTTP + 隔离主程序，模型与 CA 为 fixture
