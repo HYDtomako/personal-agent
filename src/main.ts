@@ -3,6 +3,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, watchFile, writeFileSync } from "node:fs";
 import { loadConfig } from "./config.ts";
+import { captureChildOutput } from "./child-output.ts";
 import { PiRunner, type PiEvent } from "./runner.ts";
 import { MemoryStore } from "./memory.ts";
 import { NotionMemory, NotionMemoryCache } from "./notion-memory.ts";
@@ -112,6 +113,8 @@ const runner = new PiRunner({
   cwd: workspaceDir,
   maxConcurrent: config.agent?.maxConcurrent ?? 2,
   timeoutMs: turnTimeoutMs,
+  maxToolCalls: config.agent?.maxToolCalls,
+  maxRepeatedToolFailures: config.agent?.maxRepeatedToolFailures,
 });
 
 const reviewRunner = new PiRunner({
@@ -122,9 +125,11 @@ const reviewRunner = new PiRunner({
   cwd: workspaceDir,
   maxConcurrent: 1,
   timeoutMs: reviewTimeoutMs,
+  maxToolCalls: config.agent?.maxToolCalls,
+  maxRepeatedToolFailures: config.agent?.maxRepeatedToolFailures,
 });
 
-/** 用一次无工具的 pi 调用执行纯文本任务（摘要、记忆合并）。 */
+/** 用一次无工具的 pi 调用执行纯文本任务（摘要、记忆合并）。stdout 按流式 UTF-8 解码，close 后才收尾。 */
 function runPiText(prompt: string, timeoutMs = 90_000): Promise<string> {
   const args = [
     ...config.pi.args,
@@ -143,16 +148,10 @@ function runPiText(prompt: string, timeoutMs = 90_000): Promise<string> {
       stdio: ["ignore", "pipe", "pipe"],
       env: { ...process.env, ...piEnv, PI_USER_ID: userId },
     });
-    let out = "";
     const timer = setTimeout(() => killTree(child.pid), timeoutMs);
-    child.stdout.on("data", (d: Buffer) => (out += d.toString("utf8")));
-    child.on("error", () => {
+    void captureChildOutput(child).then(({ stdout, code, error }) => {
       clearTimeout(timer);
-      resolve("");
-    });
-    child.on("exit", (code) => {
-      clearTimeout(timer);
-      resolve(code === 0 ? out.trim() : "");
+      resolve(!error && code === 0 ? stdout.trim() : "");
     });
   });
 }
@@ -243,7 +242,6 @@ async function summarizeSession(file: string): Promise<string> {
       stdio: ["ignore", "pipe", "pipe"],
       env: { ...process.env, ...piEnv, PI_USER_ID: userId },
     });
-    let out = "";
     const cleanup = () => {
       try {
         rmSync(sessionDir, { recursive: true, force: true });
@@ -252,16 +250,10 @@ async function summarizeSession(file: string): Promise<string> {
       }
     };
     const timer = setTimeout(() => killTree(child.pid), 180_000);
-    child.stdout.on("data", (d: Buffer) => (out += d.toString("utf8")));
-    child.on("error", () => {
+    void captureChildOutput(child).then(({ stdout, code, error }) => {
       clearTimeout(timer);
       cleanup();
-      resolve("");
-    });
-    child.on("exit", (code) => {
-      clearTimeout(timer);
-      cleanup();
-      resolve(code === 0 ? parseCompressOutput(out) : "");
+      resolve(!error && code === 0 ? parseCompressOutput(stdout) : "");
     });
   });
 }
@@ -515,7 +507,7 @@ async function handleRequest(request: ConversationRequest): Promise<Conversation
   conversationActive = true;
   activeRequestId = request.id;
   server.broadcast("busy", { busy: true, requestId: request.id });
-  const tools: Array<{ name: string; detail: string; isError?: boolean }> = [];
+  const tools: Array<{ id: string; name: string; detail: string; isError?: boolean }> = [];
   try {
     const { file, summary } = await memory.sessionFor(userId);
     const ingest = request.uploadPaths.length ? await ingestUploads(request.uploadPaths, {
@@ -570,10 +562,10 @@ async function handleRequest(request: ConversationRequest): Promise<Conversation
           streamed += event.text;
           server.broadcast("delta", { text: event.text, requestId: request.id });
         } else if (event.kind === "tool_start") {
-          tools.push({ name: event.name, detail: event.detail });
+          tools.push({ id: event.id, name: event.name, detail: event.detail });
           server.broadcast("tool_start", { id: event.id, name: event.name, detail: event.detail, requestId: request.id });
         } else if (event.kind === "tool_end") {
-          const hit = tools.find((tool) => tool.name === event.name && tool.isError === undefined);
+          const hit = tools.find((tool) => tool.id === event.id && tool.isError === undefined);
           if (hit) hit.isError = event.isError;
           server.broadcast("tool_end", { id: event.id, name: event.name, isError: event.isError, detail: event.detail, requestId: request.id });
         }
