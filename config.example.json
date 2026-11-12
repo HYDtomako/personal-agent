@@ -3,7 +3,8 @@
     "userId": "me",
     "workspace": "workspace",
     "maxConcurrent": 2,
-    "timeoutMs": 180000
+    "timeoutMs": 180000,
+    "maxBackgroundChars": 12000
   },
   "delegations": {
     "mode": "direct",

@@ -250,6 +250,14 @@ npm run selftest:app         # 隔离的单实例、重启、端口冲突与项�
 node scripts/docparse-selftest.ts [-v] 文件1 文件2 ...
 ```
 
+## 上下文装配与背景预算
+
+每轮将摘要、记忆、索引和后台任务状态装配为带来源的 JSON。优先保留在途任务与摘要，去重后按完整条目取舍；背景是参考数据，当前用户原文和执行协议单独保留。缺少事实原文时使用工具查询。
+
+config.agent.maxBackgroundChars 默认 12000，最小为 2，约束本层追加背景 JSON 的字符数；pi 历史和工具定义由 pi 管理，字符预算不冒充精确 Token 数。日志与 personal-agent.context 诊断通道记录预算、注入字符数、已选、省略和去重条目数；可由独立诊断模块订阅。
+
+运行 npm run selftest:context 检查预算边界、优先级、去重和配置兼容；运行 npm run selftest:background 检查实际主程序是否串接背景统计。
+
 ## 一些取舍
 
 - **定时任务与普通对话用同一套工具**：交互消息优先执行，没排队的交互任务时才轮到定时任务。
