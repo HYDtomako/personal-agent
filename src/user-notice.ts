@@ -84,9 +84,14 @@ export function retellFallbackRecord(input: {
   return `[notify] 转述未采用 reason=${input.reason}${job} detail=${detail} draft=${summarizeDiscardedCopy(input.draft ?? "")}`;
 }
 
-const COMMAND = /\b(?:npx|npm|pnpm|yarn|git|tsc|PID)\b/i;
+const PATH_TOKEN = /(?:[A-Za-z]:[\\/][^\s，。；、]+|[A-Za-z0-9_.-]+(?:[\\/][A-Za-z0-9_.-]+)+)/g;
 
-/** 返回 null 表示这段话可以发给用户。空、占位句、没有汉字或贴原文都不要发。 */
+/** 连着堆三四条路径才像清单。白话里点到一两个文件名仍然要发。 */
+function stackedPathDump(body: string): boolean {
+  return (body.match(PATH_TOKEN)?.length ?? 0) >= 3;
+}
+
+/** 返回 null 表示这段话可以发给用户。工具名、配置文件名写在白话里不算拒绝。 */
 export function userCopyRejectDetail(text: string, raw: string[] = []): string | null {
   const body = String(text ?? "").replace(/\r\n/g, "\n").trim();
   if (!body) return "empty";
@@ -95,8 +100,7 @@ export function userCopyRejectDetail(text: string, raw: string[] = []): string |
   if (/```/.test(body)) return "code-fence";
   if (/[{}`]/.test(body)) return "code-markup";
   if (/https?:/i.test(body)) return "url";
-  if (/node_modules|tsconfig/i.test(body)) return "toolchain";
-  if (COMMAND.test(body)) return "command";
+  if (stackedPathDump(body)) return "path-dump";
   if (/原先[\s\S]{0,40}。现在[\s\S]{0,40}。做了/.test(body)) return "template";
   if (pastedFrom(body, raw)) return "pasted";
   if (!clipParagraph(body)) return "no-sentence";
