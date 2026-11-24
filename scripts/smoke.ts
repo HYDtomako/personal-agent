@@ -154,7 +154,6 @@ check("附件说明可用", ing.notes.length === 2, ing.notes.join(" / "));
 console.log("[记忆]");
 const memory = new MemoryStore({
   dir: path.join(root, "memory"),
-  summarize: async () => "",
   runText: async () => "",
   log: () => {},
 });

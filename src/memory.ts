@@ -1,11 +1,12 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 /**
- * 记忆：会话窗口（短期） + 长期事实库（永久）。
+ * 记忆：Pi 会话文件（短期） + 长期事实库（永久）。
  *
- * 会话窗口：同一人 windowMs 内的连续消息续接同一个 pi 会话文件（完整上下文）；
- * 过期后旧窗口归档，并惰性压缩成 ≤300 字摘要带入新窗口（只在实际有人回来时才花这次调用）。
+ * 短期记忆就是每个用户的一份 Pi 会话文件（memory/user-<id>.jsonl）。
+ * 上下文变长时，压缩由 Pi CLI 在这份文件内部完成；这里不改名、不另起摘要、不把摘要注回提示词。
+ * 只有用户明确开新对话时，resetSession 才把当前文件改名挪进 archive/，更早的归档原样保留。
  *
  * 长期事实库：JSONL，由 pi 的 remember/recall/forget 工具直接读写
  * （workspace/.pi/extensions/memory-tools.ts）——**文件路径与格式必须与扩展保持一致**，
@@ -21,46 +22,25 @@ interface LtEntry {
 export interface MemoryOptions {
   /** 记忆根目录（<仓库根>/memory） */
   dir: string;
-  /** 上下文窗口 token 数（默认 128k） */
-  contextWindow?: number;
-  /** 会话累积到窗口的这个比例就触发压缩，默认 0.8 */
-  compressAt?: number;
-  /** 已弃用：本地使用不再按时间过期 */
-  windowMs?: number;
-  /** 已弃用：改为按 token 触发，不再看体积 */
-  summarizeMinBytes?: number;
   /** 每次注入的长期记忆字符上限 */
   maxInjectChars?: number;
   /** 注入的相关度门槛（query 二元组被条目覆盖的比例，0-1） */
   minRelevanceScore?: number;
-  /** 把旧会话压成摘要（pi 无工具调用，由主程序注入） */
-  summarize: (sessionFile: string) => Promise<string>;
   /** 跑一次纯文本 pi 调用（长期记忆合并用） */
   runText: (prompt: string) => Promise<string>;
   log: (...args: unknown[]) => void;
 }
 
-const DEFAULT_CONTEXT_WINDOW = 128_000; // 上下文窗口 token 数（默认值，可被 config 覆盖）
-const DEFAULT_COMPRESS_AT = 0.8; // 会话累积到窗口的这个比例就压缩
 const DEFAULT_INJECT_CHARS = 800; // 每轮注入长期记忆的字符上限
 const DEFAULT_MIN_RELEVANCE = 0.2; // 注入的相关度门槛：问题词组被条目覆盖的比例
 const LT_MERGE_THRESHOLD = 60; // 超过此条数触发自动合并
 const LT_MERGE_TARGET = 40; // 合并后目标条数
-const SUMMARY_SUFFIX = ".summary.txt"; // 后台预热摘要的落盘后缀（<归档>.summary.txt）
-const PREFETCH_WAIT_MS = 90_000; // 预热进行中时，新消息最多等它这么久出摘要，超时这轮不要摘要
 
 export class MemoryStore {
   readonly archiveDir: string;
   private readonly longTermDir: string;
   private readonly opts: MemoryOptions;
-  private readonly windows = new Map<string, { file: string; last: number }>();
   private readonly merging = new Set<string>();
-  /** 正在进行的后台预热：归档路径 → 摘要 Promise（同一归档不重复跑，同时供下一轮等待） */
-  private readonly prefetching = new Map<string, Promise<string>>();
-  /** 已经注入过的摘要文件（文件名），同一窗口不重复注入 */
-  private readonly consumedSummaries = new Set<string>();
-  /** 每个用户的会话代际。resetSession 每次调用都加一，用来作废进行中的同步兜底压缩。 */
-  private readonly sessionVersions = new Map<string, number>();
 
   constructor(opts: MemoryOptions) {
     this.opts = opts;
@@ -70,185 +50,23 @@ export class MemoryStore {
     mkdirSync(this.longTermDir, { recursive: true });
   }
 
-  /**
-   * 会话文件：本地使用不看时间，只看 token——累积到窗口阈值就归档并压缩，开新窗。
-   * 上一轮结束时已由 prefetch 归档并预热好摘要的，这里直接读文件，不再花一次 pi 调用。
-   */
-  async sessionFor(userId: string): Promise<{ file: string; summary: string }> {
-    const file = this.sessionFile(userId);
-    const budget = this.budgetTokens();
-
-    // 兜底路径：上一轮结束后的预热没跑（进程刚启动、预热失败等），只能现在同步压缩
-    if (existsSync(file) && estimateTokens(file) >= budget) {
-      const version = this.sessionVersions.get(userId) ?? 0;
-      const archive = this.newArchivePath(userId);
-      try {
-        renameSync(file, archive);
-        // 归档同名（同一毫秒）且已有预热摘要时直接用，别再压一遍。否则走和预热同一条落盘路径。
-        const summary = readSummary(archive) || (await this.summarizeToFile(archive));
-        // resetSession 发生在压缩期间：这份摘要属于被丢掉的会话，不能注入，也不能留给下一轮。
-        if ((this.sessionVersions.get(userId) ?? 0) !== version) {
-          this.consumedSummaries.add(path.basename(archive + SUMMARY_SUFFIX));
-          return { file, summary: "" };
-        }
-        // 摘要已落盘。本轮若在写回会话文件前失败，下一轮会把它当成未消费的预热摘要再注入一次。
-        if (summary) {
-          this.consumedSummaries.add(path.basename(archive + SUMMARY_SUFFIX));
-          this.opts.log(`[memory] 窗口达阈值，已压缩（${Math.round(statSync(archive).size / 1024)}KB）`);
-        }
-        return { file, summary };
-      } catch (err) {
-        this.opts.log("[memory] 归档/压缩失败:", err instanceof Error ? err.message : err);
-      }
-    }
-
-    // 会话文件不存在或为空 = 上一轮已被后台预热归档，把它的摘要取来注入（只注入一次）
-    const missing = !existsSync(file) || estimateTokens(file) === 0;
-    if (!missing) return { file, summary: "" };
-    return { file, summary: await this.takePrefetchedSummary(userId) };
+  /** 该用户的 Pi 会话文件。不创建、不改名、不估计体积。压缩由 Pi 在这份文件内部完成。 */
+  async sessionFor(userId: string): Promise<{ file: string }> {
+    return { file: path.join(this.opts.dir, `user-${userId}.jsonl`) };
   }
 
   /**
-   * 后台预热压缩：本轮对话刚结束时调用（此时 pi 会话的 prompt cache 还热）。
-   * 归档 + 压缩都提前做，摘要落盘到 <归档>.summary.txt，下一轮 sessionFor 直接读文件，
-   * 不用等到用户开口才同步冷启动——隔几分钟 cache TTL 就过期，同样的调用要贵十倍。
-   * 预热只是优化：任何失败只记日志，不抛、不影响主流程。
+   * 新对话：把当前会话文件改名挪进 archive/。
+   * 不删除更早的归档，也不写摘要。当前文件不存在时直接返回。
    */
-  async prefetch(userId: string): Promise<void> {
-    try {
-      const file = this.sessionFile(userId);
-      if (!existsSync(file)) return;
-      const tokens = estimateTokens(file);
-      const budget = this.budgetTokens();
-      if (tokens < budget) return;
-
-      const archive = this.newArchivePath(userId);
-      // 同一归档不重复跑（重名只可能出现在同一毫秒，这里连同已落盘摘要一起挡掉）
-      if (existsSync(archive + SUMMARY_SUFFIX) || this.prefetching.has(archive)) return;
-
-      renameSync(file, archive);
-      this.opts.log(`[memory] 后台预热开始：${path.basename(archive)}（约 ${tokens} tok，阈值 ${budget}）`);
-      const task = this.summarizeToFile(archive);
-      this.prefetching.set(archive, task);
-      const done = () => this.prefetching.delete(archive);
-      task.then(done, done);
-      const summary = await task;
-      this.opts.log(
-        summary
-          ? `[memory] 后台预热完成：${path.basename(archive)}，摘要 ${summary.length} 字符`
-          : `[memory] 后台预热未产出摘要：${path.basename(archive)}`,
-      );
-    } catch (err) {
-      this.opts.log("[memory] 后台预热失败:", err instanceof Error ? err.message : err);
-    }
-  }
-
-  /** 压缩一份归档并把结果落盘；失败返回空串，不抛。 */
-  private async summarizeToFile(archive: string): Promise<string> {
-    try {
-      const summary = (await this.opts.summarize(archive)).trim();
-      if (summary) writeFileSync(archive + SUMMARY_SUFFIX, summary, "utf8");
-      return summary;
-    } catch (err) {
-      this.opts.log("[memory] 预热压缩失败:", err instanceof Error ? err.message : err);
-      return "";
-    }
-  }
-
-  /**
-   * 取上一轮预热出来的摘要：找该用户最新一份带摘要（或正在预热）的归档；
-   * 已注入过就返回空串（同一窗口只注入一次）；预热还在跑就等它，最多等 PREFETCH_WAIT_MS。
-   */
-  private async takePrefetchedSummary(userId: string): Promise<string> {
-    try {
-      const latest = this.latestArchived(userId);
-      if (!latest) return "";
-      const name = path.basename(latest.summaryFile);
-      if (this.consumedSummaries.has(name)) return "";
-
-      let summary = readSummary(latest.archive);
-      if (!summary) {
-        const running = this.prefetching.get(latest.archive);
-        if (!running) return "";
-        const timeout = new Promise<string>((resolve) => {
-          const timer = setTimeout(() => resolve(""), PREFETCH_WAIT_MS);
-          timer.unref();
-        });
-        summary = (await Promise.race([running, timeout])).trim();
-      }
-      if (!summary) return "";
-      // 等待预热期间可能已经开了新对话：摘要文件名已被记入已消费，这里不能再注入。
-      if (this.consumedSummaries.has(name)) return "";
-
-      this.consumedSummaries.add(name);
-      this.opts.log(`[memory] 注入后台预热摘要：${path.basename(latest.archive)}（${summary.length} 字符）`);
-      return summary;
-    } catch (err) {
-      this.opts.log("[memory] 读取预热摘要失败:", err instanceof Error ? err.message : err);
-      return "";
-    }
-  }
-
-  /** 该用户最新一份有摘要、或正在预热的归档（归档名含 ISO 时间戳，按名字排就是按时间排）。 */
-  private latestArchived(userId: string): { archive: string; summaryFile: string } | undefined {
-    const prefix = `user-${userId}-`;
-    const stampTail = /^\d{4}-\d{2}-\d{2}T[\d-]+Z\.jsonl$/;
-    let best: { archive: string; summaryFile: string; name: string } | undefined;
-    try {
-      for (const name of readdirSync(this.archiveDir)) {
-        if (!name.startsWith(prefix) || !stampTail.test(name.slice(prefix.length))) continue;
-        const archive = path.join(this.archiveDir, name);
-        const summaryFile = archive + SUMMARY_SUFFIX;
-        if (!existsSync(summaryFile) && !this.prefetching.has(archive)) continue;
-        if (!best || name > best.name) best = { archive, summaryFile, name };
-      }
-    } catch (err) {
-      this.opts.log("[memory] 读取归档目录失败:", err instanceof Error ? err.message : err);
-      return undefined;
-    }
-    return best ? { archive: best.archive, summaryFile: best.summaryFile } : undefined;
-  }
-
-  private sessionFile(userId: string): string {
-    return path.join(this.opts.dir, `user-${userId}.jsonl`);
-  }
-
-  /** 归档命名规则：user-<userId>-<ISO 时间戳>.jsonl */
-  private newArchivePath(userId: string): string {
-    return path.join(this.archiveDir, `user-${userId}-${new Date().toISOString().replace(/[:.]/g, "-")}.jsonl`);
-  }
-
-  /** 触发压缩的 token 阈值（contextWindow × compressAt），sessionFor 与 prefetch 共用同一套算法 */
-  private budgetTokens(): number {
-    const window = this.opts.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
-    const ratio = this.opts.compressAt ?? DEFAULT_COMPRESS_AT;
-    return Math.round(window * ratio);
-  }
-
-  /**
-   * 该用户最新一份预热摘要（含尚未落盘、仍在 prefetching 里的）记入已消费。
-   * 新对话的每条返回路径都要先走这里：否则会话文件已被预热归档时会早退，
-   * 下一轮 sessionFor 又把刚丢掉的摘要注入进来。预热还在写文件时，先占住
-   * 摘要文件名，完成后 takePrefetchedSummary 看到已消费就不再注入。
-   */
-  private consumeLatestSummary(userId: string): void {
-    const latest = this.latestArchived(userId);
-    if (!latest) return;
-    this.consumedSummaries.add(path.basename(latest.summaryFile));
-  }
-
-  /** 新对话：丢弃当前会话窗口（归档而非删除），下次消息从空上下文开始。 */
   resetSession(userId: string): void {
-    this.sessionVersions.set(userId, (this.sessionVersions.get(userId) ?? 0) + 1);
-    this.consumeLatestSummary(userId);
     const file = path.join(this.opts.dir, `user-${userId}.jsonl`);
-    this.windows.delete(userId);
     if (!existsSync(file)) return;
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     const archive = path.join(this.archiveDir, `user-${userId}-${stamp}.jsonl`);
     try {
       renameSync(file, archive);
-      this.opts.log(`[memory] 新对话：会话窗口已归档（${path.basename(archive)}）`);
+      this.opts.log(`[memory] 新对话：当前会话已改名归档（${path.basename(archive)}）`);
     } catch (err) {
       this.opts.log("[memory] 归档会话失败:", err instanceof Error ? err.message : err);
     }
@@ -320,19 +138,6 @@ export class MemoryStore {
     }
   }
 
-  /** 清理 24 小时前的归档，控制磁盘占用。 */
-  cleanupArchives(): void {
-    const cutoff = Date.now() - 24 * 3600_000;
-    try {
-      for (const f of readdirSync(this.archiveDir)) {
-        const p = path.join(this.archiveDir, f);
-        if (statSync(p).mtimeMs < cutoff) unlinkSync(p);
-      }
-    } catch {
-      /* ignore */
-    }
-  }
-
   // ── 长期事实库（路径/格式与 memory-tools 扩展一致）──
 
   private ltFile(userId: string): string {
@@ -362,26 +167,6 @@ export class MemoryStore {
 
   private saveLt(userId: string, entries: LtEntry[]): void {
     writeFileSync(this.ltFile(userId), entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
-  }
-}
-
-/** 粗估文件 token 数（本地只看量级、够触发即可）：UTF-8 字节数 ÷ 3。 */
-function estimateTokens(file: string): number {
-  try {
-    return Math.round(statSync(file).size / 3);
-  } catch {
-    return 0;
-  }
-}
-
-/** 读预热摘要文本；不存在或读不了给空串。 */
-function readSummary(archive: string): string {
-  try {
-    const f = archive + SUMMARY_SUFFIX;
-    if (!existsSync(f)) return "";
-    return readFileSync(f, "utf8").trim();
-  } catch {
-    return "";
   }
 }
 

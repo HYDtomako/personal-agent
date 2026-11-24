@@ -47,8 +47,6 @@
     "aliyunBaseUrl": "你的百炼实例地址（形如 https://<实例id>.cn-beijing.maas.aliyuncs.com/compatible-mode/v1）"
   },
   "memory": {
-    "windowMs": 300000,
-    "summarizeMinBytes": 1024,
     "cacheTtlSeconds": 300
   },
   "notion": {
