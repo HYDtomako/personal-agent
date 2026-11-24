@@ -1,7 +1,9 @@
-/** 终态聊天由 PA 按 CA 交付转述。贴原文或写不出来时用固定短句。 */
+/** 终态通知由模型写好并用工具发到用户的 Telegram 私聊。不合格的正文不发，主程序也不另编一句。 */
 
-export const NOTICE_FALLBACK = "事情已经收尾，通知没写出来，细节在验收文件里。";
 export const RETELL_MAX = 480;
+
+/** 历史占位句。只用于识别并丢掉，不再发给用户。 */
+const PLACEHOLDER_COPY = "事情已经收尾，通知没写出来，细节在验收文件里。";
 
 export interface RetellInput {
   task: string;
@@ -9,6 +11,28 @@ export interface RetellInput {
   report?: unknown;
   acceptance?: { verdict?: string; summary?: string };
   note?: string;
+  /** 只写进失败日志，不进提示词。 */
+  jobId?: string;
+  /** 用户的 Telegram 私聊。群 id 不能填这里。 */
+  chatId?: string;
+}
+
+/** 只接受用户自己的私聊 id。群（负数）和白名单外的 id 都不用。 */
+export function telegramPrivateChatId(
+  allowFrom: readonly Array<string | number> = [],
+  source?: { channel?: string; chatId?: string },
+): string {
+  const ids = allowFrom.map((id) => String(id).trim()).filter((id) => /^[1-9]\d*$/.test(id));
+  const fromJob = source?.channel === "telegram" ? String(source.chatId ?? "") : "";
+  if (fromJob && ids.includes(fromJob)) return fromJob;
+  return ids[0] ?? "";
+}
+
+/** 模型准备发出去的正文。send 为 false 时调用方不得代发。 */
+export function noticeSendDecision(text: string, raw: string[] = []): { send: boolean; text: string; detail: string } {
+  const accepted = acceptUserCopy(text, raw);
+  if (!accepted) return { send: false, text: "", detail: userCopyRejectDetail(text, raw) ?? "rejected" };
+  return { send: true, text: accepted, detail: "" };
 }
 
 const length = (value: string) => [...value].length;
@@ -35,16 +59,55 @@ function pastedFrom(text: string, raw: string[]): boolean {
   return false;
 }
 
-/** 模型可以看见交付。这里只决定用户能不能看到这段话。 */
-export function acceptUserCopy(text: string, raw: string[] = []): string {
-  if (text.trim() === NOTICE_FALLBACK) return NOTICE_FALLBACK;
+function oneLine(value: string, limit: number): string {
+  const body = String(value ?? "").replace(/\s+/g, " ").trim();
+  const count = [...body].length;
+  if (!body) return "";
+  if (count <= limit) return body;
+  return `${[...body].slice(0, limit).join("")}…(共${count}字)`;
+}
+
+/** 被丢掉的转述草稿，压成一行，便于写进 server.log。 */
+export function summarizeDiscardedCopy(text: string, limit = 400): string {
+  return oneLine(text, limit) || "(空)";
+}
+
+/** 转述没有发给用户时的一行日志。reason 区分调用失败、过滤拒绝和异常。 */
+export function retellFallbackRecord(input: {
+  reason: "call-failure" | "filter-rejection" | "exception";
+  detail: string;
+  draft?: string;
+  jobId?: string;
+}): string {
+  const job = input.jobId ? ` job=${oneLine(input.jobId, 80)}` : "";
+  const detail = oneLine(input.detail, 300) || "(无)";
+  return `[notify] 转述未采用 reason=${input.reason}${job} detail=${detail} draft=${summarizeDiscardedCopy(input.draft ?? "")}`;
+}
+
+const COMMAND = /\b(?:npx|npm|pnpm|yarn|git|tsc|PID)\b/i;
+
+/** 返回 null 表示这段话可以发给用户。空、占位句、没有汉字或贴原文都不要发。 */
+export function userCopyRejectDetail(text: string, raw: string[] = []): string | null {
   const body = String(text ?? "").replace(/\r\n/g, "\n").trim();
-  if (!body || !/[\u4e00-\u9fff]/.test(body)) return NOTICE_FALLBACK;
-  if (/```|[{}`]|https?:|[/\\]|node_modules|tsconfig|\b(?:npx|npm|pnpm|yarn|git|tsc|PID)\b/i.test(body)) return NOTICE_FALLBACK;
-  if (/[A-Za-z][A-Za-z0-9_.:/+-]{2,}/.test(body)) return NOTICE_FALLBACK;
-  if (/原先[\s\S]{0,40}。现在[\s\S]{0,40}。做了/.test(body)) return NOTICE_FALLBACK;
-  if (pastedFrom(body, raw)) return NOTICE_FALLBACK;
-  return clipParagraph(body) || NOTICE_FALLBACK;
+  if (!body) return "empty";
+  if (body.includes(PLACEHOLDER_COPY)) return "placeholder";
+  if (!/[\u4e00-\u9fff]/.test(body)) return "no-han";
+  if (/```/.test(body)) return "code-fence";
+  if (/[{}`]/.test(body)) return "code-markup";
+  if (/https?:/i.test(body)) return "url";
+  if (/node_modules|tsconfig/i.test(body)) return "toolchain";
+  if (COMMAND.test(body)) return "command";
+  if (/原先[\s\S]{0,40}。现在[\s\S]{0,40}。做了/.test(body)) return "template";
+  if (pastedFrom(body, raw)) return "pasted";
+  if (!clipParagraph(body)) return "no-sentence";
+  return null;
+}
+
+/** 模型可以看见交付。合格就返回原文；不合格返回空字符串，调用方不要另编一句发给用户。 */
+export function acceptUserCopy(text: string, raw: string[] = []): string {
+  const body = String(text ?? "").replace(/\r\n/g, "\n").trim();
+  if (userCopyRejectDetail(body, raw)) return "";
+  return clipParagraph(body);
 }
 
 export function retellPrompt(input: RetellInput): string {
@@ -54,11 +117,14 @@ export function retellPrompt(input: RetellInput): string {
     : "未验收";
   const summary = String(input.acceptance?.summary ?? "").slice(0, 2000);
   return [
-    "你是 PA。下面是 CA 交来的结果，请用白话讲给胡同学，写成自然的一小段。",
-    "讲到这些就够：原先功能或状态是什么样，现在改了什么，这件事或其中某项做完没有，有没有验证过。",
-    "用你自己的话连起来。不要套固定格式，不要分条，不要写成「原先…现在…做了…」。",
-    "不要贴交付原文，不要贴终端输出，不要写代码、命令、路径或文件名。",
-    "CA 自己说完成不算验证过，只以下面的验收结论为准。没核过就直接说还没核过，不要先说做好了再改口。",
+    "你是 PA。下面这次后台任务已经结束。请针对这次任务写一段白话，并用 telegram_send 发到胡同学的 Telegram 私聊。",
+    "主服务不会替你入队，也不会再转发。只调用 telegram_send，不要改文件、不要派新任务、不要发到群，也不要自己填 chat id。",
+    "用自己的话连成一两段，不要分条，不要套「原先…现在…做了…」，也不要照抄别的任务的例子。",
+    "要讲清：原先是什么样，这次改了什么，做完没有，哪些验证过、哪些没验证成，还要不要他动手（例如重启或确认；不用他就直接说不用）。",
+    "少写代码、命令、路径和文件名。不要贴 CA 原文或终端输出。",
+    "CA 自己说完成不算验证过，只以下面的验收结论为准。没核过就说还没核过，并说清为什么没核成，不要先说做好了再改口。",
+    "不要发送空话占位，也不要用「没做完」搪塞一次已经结束的任务；做完没做完按验收说。",
+    "如果 telegram_send 拒绝发送，按它给的理由改一版再发，不要改成一句敷衍。",
     `任务状态：${input.status}`,
     `用户要办的事：${String(input.task ?? "").slice(0, 2000)}`,
     `CA 交付：${report}`,

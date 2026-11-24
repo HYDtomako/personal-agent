@@ -289,7 +289,8 @@ function describeTool(name: unknown, rawArgs: unknown): string {
       }
     })();
   const one = detail.replace(/\s+/g, " ").trim();
-  return one.length > 160 ? one.slice(0, 160) + "…" : one;
+  const cap = String(name) === "telegram_send" ? 400 : 160;
+  return one.length > cap ? one.slice(0, cap) + "…" : one;
 }
 
 /** 工具结果预览（只取一小段，用于 GUI 里折叠显示）。 */
