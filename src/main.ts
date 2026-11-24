@@ -1,7 +1,7 @@
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, watchFile, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, watchFile, writeFileSync } from "node:fs";
 import { loadConfig } from "./config.ts";
 import { captureChildOutput } from "./child-output.ts";
 import { PiRunner, type PiEvent } from "./runner.ts";
@@ -129,7 +129,7 @@ const reviewRunner = new PiRunner({
   maxRepeatedToolFailures: config.agent?.maxRepeatedToolFailures,
 });
 
-/** 用一次无工具的 pi 调用执行纯文本任务（摘要、记忆合并）。stdout 按流式 UTF-8 解码，close 后才收尾。 */
+/** 用一次无工具的 pi 调用做长期记忆合并，不是会话摘要。stdout 按流式 UTF-8 解码，close 后才收尾。 */
 function runPiText(prompt: string, timeoutMs = 90_000): Promise<string> {
   const args = [
     ...config.pi.args,
@@ -156,117 +156,10 @@ function runPiText(prompt: string, timeoutMs = 90_000): Promise<string> {
   });
 }
 
-/**
- * 旧会话窗口压缩：fork 归档会话跑一次调用。
- *
- * 关键约束是 prompt cache：tools 段与 thinking 级别必须和主会话一模一样，否则前缀完全
- * 分叉、次次全量 miss。实测（deepseek-flash，同一个归档）：
- *   与主会话同 thinking → cacheRead 30464 / input 316，$0.00064
- *   换 thinking = low      → cacheRead 0 / input 29479，$0.00885
- * 所以这里沿用 config.pi.args 和 config.pi.thinking，并给足超时（对齐 thinking 后推理更慢）。
- * 用 --fork 而不是 --session：不给归档文件追加内容。
- */
-const COMPRESS_PROMPT =
-  "请把上面这段对话压缩成一段摘要（300 字以内，纯文本）。必须保留：聊过的话题、关键事实与结论、未解决的问题、待办与未完成事项、用户要求记住但尚未入库的内容、涉及的文件路径与命令原文；可以丢弃：寒暄与客套、一次性问答、能重新查到的信息。不要调用任何工具，不要读取或修改任何文件，不要评论，只输出摘要正文。";
-
-const compressTmpRoot = path.join(root, "data", "compress-tmp");
-
-/** 摘要清洗：剥代码块围栏；长度离谱直接放弃——宁可这轮没有摘要，也不注入坏数据。 */
-function cleanSummary(raw: string): string {
-  let out = raw.trim();
-  const fenced = out.match(/^```[\w-]*\n([\s\S]*?)\n?```$/);
-  if (fenced) out = fenced[1].trim();
-  out = out.replace(/^```[\w-]*\s*/, "").replace(/\s*```$/, "").trim();
-  if (out.length < 50 || out.length > 1500) return "";
-  return out;
-}
-
-/** 解析 --mode json 事件流：取最后一条 assistant 文本，顺带统计 cache 命中与工具调用。 */
-function parseCompressOutput(raw: string): string {
-  const texts: string[] = [];
-  let input = 0;
-  let cacheRead = 0;
-  let toolCalls = 0;
-  for (const line of raw.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith("{")) continue;
-    let ev: any;
-    try {
-      ev = JSON.parse(trimmed);
-    } catch {
-      continue;
-    }
-    const msg = ev?.message;
-    if (msg?.role !== "assistant") continue;
-    if (Array.isArray(msg.content)) {
-      const text = msg.content
-        .filter((p: any) => p?.type === "text" && typeof p.text === "string")
-        .map((p: any) => p.text)
-        .join("\n")
-        .trim();
-      if (text) texts.push(text);
-      toolCalls += msg.content.filter((p: any) => p?.type === "toolCall" || p?.type === "tool_use").length;
-    }
-    input += Number(msg.usage?.input ?? 0);
-    cacheRead += Number(msg.usage?.cacheRead ?? 0);
-  }
-  const summary = cleanSummary(texts.at(-1) ?? "");
-  log(`[memory] 压缩调用：input ${input} tok，cacheRead ${cacheRead} tok，工具调用 ${toolCalls} 次，摘要 ${summary.length} 字符`);
-  return summary;
-}
-
-async function summarizeSession(file: string): Promise<string> {
-  const spec = currentModelSpec();
-  if (!spec) return "";
-  mkdirSync(compressTmpRoot, { recursive: true });
-  // fork 会落一个新会话文件，用完即删，不往 pi 的会话目录里堆垃圾。
-  const sessionDir = mkdtempSync(path.join(compressTmpRoot, "fork-"));
-  const args = [
-    ...config.pi.args,
-    "--thinking",
-    config.pi.thinking,
-    "--model",
-    spec,
-    "--fork",
-    file,
-    "--session-dir",
-    sessionDir,
-    "--mode",
-    "json",
-    COMPRESS_PROMPT,
-  ];
-  return new Promise((resolve) => {
-    const child = spawn(config.pi.command, args, {
-      cwd: workspaceDir,
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, ...piEnv, PI_USER_ID: userId },
-    });
-    const cleanup = () => {
-      try {
-        rmSync(sessionDir, { recursive: true, force: true });
-      } catch {
-        /* 清理失败不影响摘要 */
-      }
-    };
-    const timer = setTimeout(() => killTree(child.pid), 180_000);
-    void captureChildOutput(child).then(({ stdout, code, error }) => {
-      clearTimeout(timer);
-      cleanup();
-      resolve(!error && code === 0 ? parseCompressOutput(stdout) : "");
-    });
-  });
-}
-
 const memory = new MemoryStore({
   dir: path.join(root, "memory"),
-  contextWindow: config.memory?.contextWindow,
-  compressAt: config.memory?.compressAt,
   maxInjectChars: config.memory?.maxInjectChars,
   minRelevanceScore: config.memory?.minRelevanceScore,
-  windowMs: config.memory?.windowMs,
-  summarizeMinBytes: config.memory?.summarizeMinBytes,
-  summarize: summarizeSession,
   runText: runPiText,
   log,
 });
@@ -509,7 +402,7 @@ async function handleRequest(request: ConversationRequest): Promise<Conversation
   server.broadcast("busy", { busy: true, requestId: request.id });
   const tools: Array<{ id: string; name: string; detail: string; isError?: boolean }> = [];
   try {
-    const { file, summary } = await memory.sessionFor(userId);
+    const { file } = await memory.sessionFor(userId);
     const ingest = request.uploadPaths.length ? await ingestUploads(request.uploadPaths, {
       dir: uploadDir, log, maxTextChars: config.files?.maxTextChars,
       maxTotalChars: config.files?.maxTotalChars, pdftotext: config.files?.pdftotext,
@@ -545,7 +438,6 @@ async function handleRequest(request: ConversationRequest): Promise<Conversation
       memorySource = "本地归档兜底（Notion 不可用）";
     }
     const background: string[] = [];
-    if (summary) background.push(`[此前对话摘要（更早内容已压缩，供参考）]\n${summary}`);
     if (memoryIndex) background.push(`[记忆目录（索引，不是记忆条目）]\n下面是长期记忆的目录索引，只用于判断"有没有相关记忆、要不要 recall"；它不是记忆条目，不要当事实本身引用，需要原文时用 recall。\n${memoryIndex}`);
     if (memoryLines.length) background.push(`[系统背景——长期记忆，来自 ${memorySource}，active ${memoryTotal} 条；仅在相关时参考]\n${memoryLines.join("\n")}`);
     const allJobs = delegations.list();
@@ -586,12 +478,6 @@ async function handleRequest(request: ConversationRequest): Promise<Conversation
     conversationActive = false;
     activeRequestId = undefined;
     server.broadcast("busy", { busy: false, requestId: request.id });
-    // 本轮回复已产生：此刻 pi 会话的 prompt cache 还热，趁现在把「下一轮的窗口压缩」在后台做掉。
-    // 不 await、不阻塞用户；具体归档名与摘要长度由 memory 侧日志给出，这里只兜异常。
-    log("[memory] 后台预热：已提交（本轮结束）");
-    void memory.prefetch(userId).catch((error) => {
-      log("[memory] 后台预热异常:", error instanceof Error ? error.message : error);
-    });
   }
 }
 
@@ -785,9 +671,7 @@ function cleanupWorkspaceTemp(): void {
   }
 }
 
-setInterval(() => memory.cleanupArchives(), 30 * 60_000).unref();
 setInterval(() => cleanupWorkspaceTemp(), 60 * 60_000).unref();
-memory.cleanupArchives();
 cleanupWorkspaceTemp();
 log(
   `[main] pi-agent 启动 | 用户 ${userId} | 工作目录 ${workspaceDir} | 模型 ${currentModel}（${currentModelSpec() ?? "?"}）`,

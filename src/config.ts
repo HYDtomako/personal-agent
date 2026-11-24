@@ -76,12 +76,6 @@ export interface AgentConfig {
     models?: Record<string, string>;
   };
   memory?: {
-    windowMs?: number;
-    summarizeMinBytes?: number;
-    /** 上下文窗口 token 数（默认 128k；压缩判定是 文件字节÷3 的粗估） */
-    contextWindow?: number;
-    /** 会话累积到窗口的这个比例就归档压缩（默认 0.8） */
-    compressAt?: number;
     /** 每轮注入长期记忆的字符上限（默认 800） */
     maxInjectChars?: number;
     /** 注入的相关度门槛：问题词组被记忆条目覆盖的比例（0-1，默认 0.2） */

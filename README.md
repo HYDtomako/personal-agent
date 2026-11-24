@@ -172,7 +172,7 @@ src/
   herdr.ts   有限时 CLI 适配器与独立 server 启动
   notifications.ts 持久回执 outbox
   protocol.ts 回复渠道的共享类型与校验
-  memory.ts  会话窗口（短期）+ 本地归档读取兜底
+  memory.ts  Pi 会话文件路径 + 本地长期归档读取兜底
   notion-memory.ts  Notion Memory 读取、相关性选择与注入
   store.ts   对话记录（页面显示用）
   tasks.ts   定时任务调度（交互任务优先）

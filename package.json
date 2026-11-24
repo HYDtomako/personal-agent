@@ -32,6 +32,7 @@
     "selftest:video": "node scripts/video-selftest.ts",
     "video:subtitle": "node scripts/video-subtitle.ts",
     "selftest:runner": "node --test scripts/runner-selftest.mjs",
-    "selftest:utf8-child": "node --test scripts/utf8-child-selftest.mjs"
+    "selftest:utf8-child": "node --test scripts/utf8-child-selftest.mjs",
+    "selftest:memory": "node scripts/memory-reset-selftest.ts"
   }
 }

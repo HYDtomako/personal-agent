@@ -523,7 +523,6 @@ async function main() {
     fs.copyFileSync(archiveSource, path.join(archiveDir, "long-term", "me.jsonl"));
     const store = new MemoryStore({
       dir: archiveDir,
-      summarize: async () => "",
       runText: async () => "",
       log: () => {},
     });
