@@ -117,10 +117,10 @@ export default function telegramSendExtension(pi: ExtensionAPI) {
     description: "把终态通知发到胡同学的 Telegram 私聊。目标已固定，不能改成群或其他人。",
     promptSnippet: "telegram_send: send the completion notice to the user's Telegram private chat",
     promptGuidelines: [
-      "只用于后台任务结束后的那条白话通知。",
+      "用于后台任务结束，以及本轮超时或中途出错时的白话通知。",
       "text 要讲清原先什么样、这次改了什么、做完没有、哪些验证过、哪些没验证成、还要不要用户动手。",
       "用自己的话写成一两段，不要分条，不要套固定格式，不要照抄别的任务。",
-      "少写代码、命令、路径和文件名。不要发空话，也不要用「没做完」搪塞。",
+      "少写代码、命令、路径和文件名。不要发空话。任务确实没做完时直说没做完；已经做完的不要说成没做完。",
       "不要传 chat id。工具拒绝时按理由改一版再发，主程序不会替你转发。",
     ],
     parameters: {

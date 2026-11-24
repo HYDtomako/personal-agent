@@ -361,6 +361,7 @@ const server = new GuiServer({
   onExternal: async (input) => {
     const request = submitConversation({ text: input.text });
     const result = await requests.wait(request.id);
+    if (result.meta?.modelNotice === true) return "";
     return result.reply || result.error || "（本轮没有输出）";
   },
   submitRequest: submitConversation,
@@ -574,15 +575,20 @@ async function handleRequest(request: ConversationRequest): Promise<Conversation
     });
     const ownJobs = delegations.list().filter((job) => job.requestId === request.id);
     const { text, images } = resolveImages(redactSensitive(result.text || streamed));
-    const error = !result.ok ? redactSensitive(result.error || "PA 本轮未正常结束") : undefined;
-    let reply = text || (ownJobs.length ? `已接收后台任务：${ownJobs.map((job) => job.id).join("、")}。完成或失败会自动回报，你可以继续聊天。` : "（本轮没有输出）");
-    if (error) reply += `\n\n（${error}${ownJobs.length ? "；已派发的后台任务不受本轮超时影响" : ""}）`;
     log(`[run] request=${request.id} ok=${result.ok} ${result.durationMs}ms 工具 ${tools.length} 个`);
-    return { reply, error, meta: { requestId: request.id, durationMs: result.durationMs, tokens: result.usage?.tokens, cost: result.usage?.cost, error, tools, ...(images.length ? { images } : {}) } };
+    if (!result.ok) {
+      const message = redactSensitive(result.error || "PA 本轮未正常结束");
+      await notifyUnfinishedTurn(request, /超时/.test(message) ? "timed_out" : "failed", message, text);
+      return { reply: "", error: message, meta: { requestId: request.id, modelNotice: true, durationMs: result.durationMs, tokens: result.usage?.tokens, cost: result.usage?.cost, error: message, tools, ...(images.length ? { images } : {}) } };
+    }
+    const reply = text || (ownJobs.length ? `已接收后台任务：${ownJobs.map((job) => job.id).join("、")}。完成或失败会自动回报，你可以继续聊天。` : "（本轮没有输出）");
+    return { reply, meta: { requestId: request.id, durationMs: result.durationMs, tokens: result.usage?.tokens, cost: result.usage?.cost, tools, ...(images.length ? { images } : {}) } };
   } catch (error) {
     const message = redactSensitive(error instanceof Error ? error.message : String(error));
     log("[main] 处理异常:", message);
-    return { reply: `（本轮处理失败：${message}）`, error: message, meta: { requestId: request.id, error: message } };
+    try { await notifyUnfinishedTurn(request, "failed", message); }
+    catch (inner) { log(retellFallbackRecord({ reason: "exception", detail: inner instanceof Error ? inner.message : String(inner), jobId: request.id })); }
+    return { reply: "", error: message, meta: { requestId: request.id, modelNotice: true, error: message } };
   } finally {
     conversationActive = false;
     activeRequestId = undefined;
@@ -597,6 +603,10 @@ async function handleRequest(request: ConversationRequest): Promise<Conversation
 }
 
 async function settleRequest(request: ConversationRequest): Promise<void> {
+  if (request.meta?.modelNotice === true) {
+    log(`[notify] 本轮未完成，已交给模型用 telegram_send 发送，主程序不代发 request=${request.id}`);
+    return;
+  }
   const text = redactSensitive(request.reply || request.error || "（本轮没有输出）");
   const id = `reply:${request.id}`;
   notifications.put({ id, source: request.source, text: request.source.channel === "qq" ? text.slice(0, 3000) : text, kind: "reply" });
@@ -631,6 +641,18 @@ function jobView(job: DelegationJob) {
 function broadcastJobs(): void {
   const jobs = delegations.list().map(jobView).map(({ lastOutput: _output, report: _report, ...job }) => job);
   server.broadcast("delegations", JSON.parse(redactSensitive(JSON.stringify({ jobs }))));
+}
+
+/** 本轮超时或中途出错时，交给和终态通知同一条模型发送通道，主程序不写底文。 */
+async function notifyUnfinishedTurn(request: ConversationRequest, status: "failed" | "timed_out", problem: string, partial = ""): Promise<void> {
+  await retellForUser({
+    task: request.text,
+    status,
+    report: partial ? { partial: partial.slice(0, 2000) } : undefined,
+    note: `这次没有做完。请直说没做完。卡在或出错：${problem.slice(0, 2000)}`,
+    jobId: request.id,
+    chatId: telegramPrivateChatId(telegramAllowFrom, request.source),
+  }, partial ? [partial] : []);
 }
 
 /** 让模型自己写终态通知并 telegram_send。写不出发、发不出去时只记日志，主程序不代发。 */
@@ -713,11 +735,13 @@ async function handleDelegationEvent(job: DelegationJob, event: "terminal" | "at
           : picked
             ? { verdict: picked.verdict, summary: picked.summary }
             : undefined;
-      const note = unsettled
-        ? "收尾还没确认，不能把结果说成已经落稳"
-        : job.status === "completed"
-          ? ""
-          : "这次没有做完独立验收";
+      const unfinished = job.status === "failed" || job.status === "timed_out" || job.status === "cancelled";
+      const stuck = [job.message, job.cleanupError].filter(Boolean).map((item) => String(item).slice(0, 1500)).join("。");
+      const note = unfinished
+        ? `这次没有做完。请直说没做完。状态：${job.status}。卡在或出错：${stuck}`
+        : unsettled
+          ? "收尾还没确认，不能把结果说成已经落稳"
+          : "";
       const guard = [JSON.stringify(job.report ?? ""), job.lastOutput];
       try {
         await retellForUser({ task: job.task, status: job.status, report: job.report, acceptance, note, jobId: job.id, chatId: telegramPrivateChatId(telegramAllowFrom, job.source) }, guard);
