@@ -1,27 +1,47 @@
-// 离线验证「后台任务终态 → 聊天五件事」：不启动服务、不调用模型、不派发任务、不写 memory/。
+// 离线验证终态通知：不启动服务、不调用模型、不派发任务、不写 memory/。
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { stripTypeScriptTypes } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { deliveryText } from "../src/delivery-pipeline.ts";
-import {
-  USER_NOTICE_MAX, cleanupHoldNotice, failureNotice, finalizeUserNotice, noticeReady, renderFiveNotice,
-  unsettledNotice, userNoticeFromReview,
-} from "../src/user-notice.ts";
+import { RETELL_MAX, acceptUserCopy, attentionNotice, noticeSendDecision, retellFallbackRecord, retellPrompt, telegramPrivateChatId, userCopyRejectDetail } from "../src/user-notice.ts";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const source = readFileSync(path.join(root, "src", "main.ts"), "utf8");
+const MARKER = "CA_REPORT_zz9";
+const SNAP = "终端快照" + "甲乙丙丁戊己庚辛壬癸".repeat(4);
+const PASSED = "登录以前失败了只会弹一句看不懂的话。现在失败时会把原因说清楚。这件事做完了，我核对过，是通过的。";
+const OPEN = "登录提示那边有改动，但这块还没核过。";
+const PLACEHOLDER = "事情已经收尾，通知没写出来，细节在验收文件里。";
 let checks = 0;
 const pass = (message) => { checks += 1; console.log(`ok ${checks} ${message}`); };
 
 function sliceDeclaration(text, signature) {
   const start = text.indexOf(signature);
   assert(start >= 0, `main.ts 缺少 ${signature}`);
-  const open = text.indexOf("{", start + signature.length);
+  let paren = 0;
+  let angle = 0;
+  let quote = null;
+  let started = false;
+  let open = -1;
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === "\\") { i += 1; continue; }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "\"" || ch === "'" || ch === "`") { quote = ch; continue; }
+    if (ch === "(") { paren += 1; started = true; }
+    else if (ch === ")") paren -= 1;
+    else if (ch === "<" && paren === 0 && started) angle += 1;
+    else if (ch === ">" && paren === 0 && angle > 0) angle -= 1;
+    else if (ch === "{" && paren === 0 && angle === 0 && started) { open = i; break; }
+  }
   assert(open > 0, `${signature} 缺少函数体`);
   let depth = 0;
-  let quote = null;
+  quote = null;
   for (let i = open; i < text.length; i += 1) {
     const ch = text[i];
     if (quote) {
@@ -38,123 +58,170 @@ function sliceDeclaration(text, signature) {
   throw new Error(`${signature} 函数体未闭合`);
 }
 
-const forbidden = /[/\\]|`|\{|\}|\bnpx\b|\bnpm\b|\btsc\b|\bPID\b|worktree|node_modules|\.ts\b|\.js\b|Error:|at run|:[\\/]|--\w/;
-
-function assertNotice(text, label) {
-  assert.equal(noticeReady(text), true, `${label} 五字段不齐：${text}`);
-  assert.ok([...text].length <= USER_NOTICE_MAX, `${label} 超长 ${[...text].length}：${text}`);
-  assert.equal([...text].length, text.length, `${label} 按字符计数应与码点数一致`);
-  assert.doesNotMatch(text, forbidden, `${label} 夹了不能进聊天的内容：${text}`);
-  assert.equal(text.indexOf("原先"), 0);
-  assert.ok(text.indexOf("现在") > 0 && text.indexOf("做了") > text.indexOf("现在"));
-  assert.match(text, /过，|挂，|未核实，/);
-  assert.match(text, /无需动手|要确认预览|要修/);
-}
-
 try {
-  assert.equal(USER_NOTICE_MAX, 150);
+  assert.equal(acceptUserCopy("", [SNAP]), "");
+  assert.equal(acceptUserCopy(PLACEHOLDER, [SNAP]), "");
+  assert.equal(userCopyRejectDetail(PLACEHOLDER, []), "placeholder");
+  assert.equal(acceptUserCopy(`前面还有一句。${PLACEHOLDER}`, []), "");
+  assert.equal(acceptUserCopy(PASSED, [SNAP, `{"summary":"${MARKER}"}`]), PASSED);
+  assert.equal(acceptUserCopy("原先这件事还没完成。现在已经按目标做完。做了登录提示。过，核对通过。无需动手。", []), "");
+  assert.equal(userCopyRejectDetail("原先这件事还没完成。现在已经按目标做完。做了登录提示。过，核对通过。无需动手。", []), "template");
+  const withTools = "做了项目，仓库无 tsconfig、node_modules，也没跑 npm、pnpm、yarn、tsc，PID 只是说明进程。TypeScript 没装，也没提交 git。";
+  assert.equal(userCopyRejectDetail(withTools, []), null);
+  assert.equal(acceptUserCopy(withTools, []), withTools);
+  assert.equal(noticeSendDecision(withTools).send, true);
+  const toolExcerpt = "但 typecheck 没能跑成：仓库本来就没有 tsconfig，也没装 TypeScript，只能等真正部署到 bot 上时看运行日志。我没重启你的 bot，也没提交 git；要不要重启让它生效，你说一声。";
+  assert.equal(acceptUserCopy(toolExcerpt, []), toolExcerpt);
+  assert.equal(noticeSendDecision(toolExcerpt).send, true);
+  const gold = "戳一戳的回复功能已经做完，并已写入代码。之前 bot 对戳一戳完全没反应，因为通知事件里只处理了成员增减和撤回。现在只要机器人本人被戳，且发生在娱乐模式群里，就会按以下规则处理：同一个人第一次被戳时必定回一句，之后每次按 0.4 的概率决定是否回；同一个人在同一个群里的回复间隔至少 10 分钟，同一个群里两次回复之间至少隔 60 秒。这几个数值都写进配置了，你想调随时改。回复走当前模型，限制在 40 字内；模型超时或报错时，就发一句本地兜底的话，不会在群里出丑，也不影响其他消息。\n验证情况：自带的 poke 测试脚本全部通过，实际运行了事件解析、模式门控、首次必回、概率分支、双冷却、模型失败兜底，以及一套模拟的完整收发链路；另外两个原有的自检脚本也仍然通过，说明没有影响别的功能。但 typecheck 没能跑成：仓库本来就没有 tsconfig，也没装 TypeScript，只能等真正部署到 bot 上时看运行日志。我没重启你的 bot，也没提交 git；要不要重启让它生效，你说一声。";
+  assert.equal(userCopyRejectDetail(gold, []), null);
+  assert.equal(acceptUserCopy(gold, []), gold);
+  assert.equal(noticeSendDecision(gold).send, true);
+  assert.equal(noticeSendDecision(gold).text, gold);
+  assert.equal(acceptUserCopy("登录提示改好了。\n```\nconst x = 1;\n```", []), "");
+  assert.equal(userCopyRejectDetail("登录提示改好了。\n```\nconst x = 1;\n```", []), "code-fence");
+  assert.equal(userCopyRejectDetail("登录改好了。function poke(){ return true; }", []), "code-markup");
+  const pathDump = "这次动了 src/a.ts、src/b/c.ts、lib/d/e.ts。登录提示改好了。";
+  assert.equal(acceptUserCopy(pathDump, []), "");
+  assert.equal(userCopyRejectDetail(pathDump, []), "path-dump");
+  const OLD_LATIN = /[A-Za-z][A-Za-z0-9_.:/+-]{2,}/;
+  const withNames = "登录失败时会说明原因。Cursor 上的 PR16 已经合进去了，我核对过，是通过的。";
+  assert.match(withNames, OLD_LATIN);
+  assert.equal(userCopyRejectDetail(withNames, []), null);
+  assert.equal(acceptUserCopy(withNames, []), withNames);
+  const withPath = "改动在 src/login.ts，登录失败时会说明原因。我核对过，是通过的。";
+  assert.match(withPath, /[/\\]/);
+  assert.match(withPath, OLD_LATIN);
+  assert.equal(acceptUserCopy(withPath, []), withPath);
+  const withBackslash = "改动在 D:\\work\\login.ts，登录失败时会说明原因。我核对过，是通过的。";
+  assert.match(withBackslash, /[/\\]/);
+  assert.equal(acceptUserCopy(withBackslash, []), withBackslash);
+  const withAcronym = "做了项目：+ESM+，零运行时依赖，非。";
+  assert.match(withAcronym, OLD_LATIN);
+  assert.equal(acceptUserCopy(withAcronym, []), withAcronym);
+  assert.equal(acceptUserCopy("Cursor PR16 is merged.", []), "");
+  assert.equal(userCopyRejectDetail("Cursor PR16 is merged.", []), "no-han");
+  assert.equal(userCopyRejectDetail("   ", []), "empty");
+  assert.equal(userCopyRejectDetail("说明写在 https://example.com/login 。我核对过。", []), "url");
+  assert.equal(acceptUserCopy("说明写在 https://example.com/login 。我核对过。", []), "");
+  const withMarker = `登录提示改好了。${MARKER}`;
+  assert.match(withMarker, OLD_LATIN);
+  assert.equal(acceptUserCopy(withMarker, [`{"summary":"${MARKER}"}`]), withMarker);
+  assert.equal(acceptUserCopy(SNAP, [SNAP]), "");
+  assert.equal(userCopyRejectDetail(SNAP, [SNAP]), "pasted");
+  assert.equal(acceptUserCopy(`${OPEN}${SNAP.slice(0, 40)}`, [SNAP]), "");
+  const long = Array.from({ length: 6 }, () => `${"好".repeat(90)}。`).join("");
+  const clipped = acceptUserCopy(long, []);
+  assert.notEqual(clipped, "");
+  assert.ok([...clipped].length <= RETELL_MAX);
+  assert.ok(clipped.endsWith("。"));
+  assert.equal(acceptUserCopy("好".repeat(500), []), "");
+  assert.equal(userCopyRejectDetail("好".repeat(500), []), "no-sentence");
+  const longDraft = `登录提示改好了。${"甲".repeat(500)}`;
+  const record = retellFallbackRecord({ reason: "filter-rejection", detail: "pasted\nraw", draft: longDraft, jobId: "ca-1" });
+  assert.match(record, /^\[notify\] 转述未采用 reason=filter-rejection job=ca-1 detail=pasted raw draft=/);
+  assert.match(record, /共\d+字/);
+  assert.equal(record.includes("\n"), false);
+  assert.match(retellFallbackRecord({ reason: "exception", detail: "", draft: "" }), /reason=exception detail=\(无\) draft=\(空\)/);
+  assert.match(retellFallbackRecord({ reason: "call-failure", detail: "timeout", draft: withNames, jobId: "ca-x" }), /reason=call-failure job=ca-x detail=timeout draft=登录失败时会说明原因/);
+  pass("合格中文会留下，夹英文词也可以；空话、占位句、原文和快照不发给用户");
 
-  const passed = userNoticeFromReview({
-    verdict: "passed",
+  const report = { summary: `登录提示改清楚了 ${MARKER}`, changedFiles: ["src/login.ts"] };
+  const prompt = retellPrompt({
     task: "把登录失败的提示改清楚",
-    summary: "登录失败时会说明原因，刷新后仍保持登录",
+    status: "completed",
+    report,
+    acceptance: { verdict: "passed", summary: "登录失败时会说明原因" },
   });
-  assertNotice(passed, "验收通过");
-  assert.match(passed, /^原先这件事还没完成。现在已经按目标做完。做了把登录失败的提示改清楚。过，登录失败时会说明原因，刷新后仍保持登录。无需动手。$/);
-  pass(`例1 验收通过 ${[...passed].length} 字：${passed}`);
+  assert.match(prompt, new RegExp(MARKER));
+  assert.match(prompt, /CA 交付/);
+  assert.match(prompt, /原先是什么样/);
+  assert.match(prompt, /这次改了什么/);
+  assert.match(prompt, /做完没有/);
+  assert.match(prompt, /哪些验证过/);
+  assert.match(prompt, /哪些没验证成/);
+  assert.match(prompt, /还要不要他动手/);
+  assert.match(prompt, /telegram_send/);
+  assert.match(prompt, /主服务不会替你入队/);
+  assert.match(prompt, /不要把已经做完的事说成没做完/);
+  assert.doesNotMatch(prompt, /直说没做完/);
+  assert.doesNotMatch(prompt, /戳一戳|0\.4|娱乐模式/);
+  const timeoutPrompt = retellPrompt({ task: "把登录失败的提示改清楚", status: "timed_out", note: "超过 PA 窗口，卡在编译" });
+  assert.match(timeoutPrompt, /直说没做完/);
+  assert.match(timeoutPrompt, /卡在哪/);
+  assert.match(timeoutPrompt, /超过 PA 窗口，卡在编译/);
+  assert.doesNotMatch(timeoutPrompt, /不要把已经做完的事说成没做完/);
+  assert.match(retellPrompt({ task: "把登录失败的提示改清楚", status: "failed", note: "中途出错：连接中断" }), /直说没做完[\s\S]*连接中断/);
+  assert.doesNotMatch(prompt, new RegExp(SNAP));
+  assert.doesNotMatch(prompt, /终端快照（待核实）/);
+  const spoken = "登录失败以前只会弹一句看不懂的话。这次改成会说明是超时还是账号不对，Cursor 上这件事做完了。我核对过失败提示的两条路径，都通过了；页面上旧按钮没另写脚本，所以那部分还没核。你刷新一下就能看到，不用重启。";
+  assert.equal(noticeSendDecision(spoken).send, true);
+  assert.equal(noticeSendDecision(spoken).text, spoken);
+  assert.match(spoken, /Cursor/);
+  assert.doesNotMatch(spoken, /戳一戳/);
+  assert.equal(noticeSendDecision(PLACEHOLDER).send, false);
+  assert.equal(noticeSendDecision("Cursor PR16 is merged.").detail, "no-han");
+  assert.equal(telegramPrivateChatId(["100000002"], { channel: "telegram", chatId: "-100" }), "100000002");
+  assert.equal(telegramPrivateChatId(["100000002"], { channel: "telegram", chatId: "100000002" }), "100000002");
+  assert.equal(telegramPrivateChatId([], { channel: "telegram", chatId: "100000002" }), "");
+  assert.equal(acceptUserCopy(PASSED, [JSON.stringify(report), SNAP]), PASSED);
+  assert.doesNotMatch(PASSED, new RegExp(MARKER));
+  pass("提示词要求按这次任务写完整白话并用 telegram_send 发送；示例任务不会被照抄");
 
-  const nasty = [
-    "核对没过：npx tsc --noEmit 失败",
-    "Error: boom",
-    "    at run (D:\\pi-agent\\src\\main.ts:10:1)",
-    "工作树 /memory/worktrees/ca-x",
-  ].join("\n");
-  const failed = userNoticeFromReview({
-    verdict: "failed",
-    task: "把登录失败的提示改清楚\n详见 src/main.ts",
-    summary: nasty,
-  });
-  assertNotice(failed, "验收没过");
-  assert.match(failed, /挂，核对没过。要修没通过的阻塞。$/);
-  assert.doesNotMatch(failed, /src|main|pi-agent|tsc|boom/);
-  const reviewFile = {
-    verdict: "failed",
-    summary: nasty,
-    checks: ["npx tsc --noEmit", "D:\\pi-agent\\src\\main.ts"],
-    detail: `后台任务 ca-x：验收未通过。\n${nasty}`.slice(0, 6000),
-    rawReply: JSON.stringify({ verdict: "failed", summary: nasty, checks: ["npx tsc --noEmit"], failures: ["tsc"] }),
-    text: failed,
-  };
-  assert.match(reviewFile.detail, /npx tsc/);
-  assert.match(reviewFile.detail, /main\.ts/);
-  assert.match(reviewFile.rawReply, /failures/);
-  assert.equal(reviewFile.checks.length, 2);
-  assert.doesNotMatch(reviewFile.text, forbidden);
-  pass(`例2 验收没过（栈和路径只留在文件）${[...failed].length} 字：${failed}`);
+  assert.equal(deliveryText({
+    state: "cleaned", mode: "git-worktree",
+    targetReview: { verdict: "passed", summary: `原项目 ${MARKER}` },
+    executionReview: { verdict: "passed", summary: `${MARKER} npx tsc /memory/worktrees/ca-1` },
+  }), "原项目已更新");
+  assert.equal(deliveryText({ state: "rolled_back", targetReview: { verdict: "failed", summary: SNAP } }), "改动已撤回");
+  assert.equal(deliveryText({ state: "blocked", executionReview: { verdict: "failed", summary: "bad" } }), "验收没通过");
+  assert.equal(deliveryText({ state: "changes_ready" }), "这块还没核过");
+  pass("任务列表状态不是聊天文案，也不带报告原文");
 
-  const delivered = deliveryText({
-    id: "ca-1", state: "cleaned", mode: "git-worktree",
-    targetReview: { verdict: "passed", summary: "原项目上的登录提示已经改清楚" },
-    executionReview: { verdict: "passed", summary: "npx tsc --noEmit passed at /memory/worktrees/ca-1" },
-    changes: [{ path: "src/login.ts", kind: "modify" }],
-    worktreePath: "/memory/worktrees/ca-1",
-    identity: { targetCwd: "D:\\pi-agent", kind: "git", targetBranch: "refs/heads/main" },
-    alreadyPresent: false, targetUpdated: true, cleanupDone: true,
-    error: "backup kept at D:\\pi-agent\\backup",
-  });
-  assertNotice(delivered, "交付完成");
-  assert.match(delivered, /^原先改动只在副本里。现在原项目已经是改完的样子。做了核对通过后放回原项目。过，原项目上的登录提示已经改清楚。无需动手。$/);
-  pass(`例3 交付完成 ${[...delivered].length} 字：${delivered}`);
+  assert.equal(attentionNotice("ca-x", "15 分钟无进展"), "后台任务 ca-x 需要关注：15 分钟无进展。\n任务未因 PA 对话结束而停止，整体执行时限仍有效；你可以继续聊天或取消该任务。");
+  assert.doesNotMatch(attentionNotice("ca-x", `${MARKER} ${SNAP}`), new RegExp(`${MARKER}|终端快照`));
+  assert.match(attentionNotice("ca-x", `${MARKER} {"summary":"done"}`), /连续一段时间未观察到进展/);
+  pass("需要关注仍是短提示，不贴原始输出");
 
-  const rolled = deliveryText({
-    id: "ca-2", state: "rolled_back", mode: "git-worktree",
-    targetReview: { verdict: "failed", summary: "登录提示仍是旧的，用户看不出失败原因" },
-    changes: [{ path: "src/login.ts" }],
-    worktreePath: "D:\\pi-agent\\memory\\worktrees\\ca-2",
-    alreadyPresent: false, targetUpdated: false,
-    error: "rollback kept /memory/worktrees/ca-2",
-  });
-  assertNotice(rolled, "交付撤回");
-  assert.match(rolled, /挂，/);
-  assert.match(rolled, /要修没通过的阻塞/);
-  pass(`例4 交付撤回 ${[...rolled].length} 字：${rolled}`);
-
-  const flooded = renderFiveNotice({
-    before: "原先".repeat(80),
-    now: "现在".repeat(80),
-    did: "处理".repeat(80),
-    outcome: "未核实",
-    reason: "原因".repeat(80) + " npx tsc /tmp/a.ts",
-    action: "要确认预览",
-  });
-  assertNotice(flooded, "超长硬截");
-  assert.doesNotMatch(flooded, /tsc|\/tmp/);
-  pass("超长原文先丢掉命令和路径，再硬截到 150 且五字段还在");
-
-  const poisoned = finalizeUserNotice("后台任务 ca-x：验收通过。\n- 已跑 npx tsc --noEmit\n- PID 4321 /memory/worktrees/ca-x\n{\"checks\":[\"a\"]}");
-  assertNotice(poisoned, "脏原文兜底");
-  assert.doesNotMatch(poisoned, /tsc|PID|worktree|checks/);
-  pass("不能渲染成五件事的原文不会原样进聊天");
-
-  assertNotice(failureNotice("timed_out", "plain"), "超时");
-  assertNotice(failureNotice("failed", "direct"), "直接失败");
-  assertNotice(failureNotice("cancelled", "delivery"), "取消");
-  pass("失败、超时、取消也是五件事，不贴原始报错");
+  const system = readFileSync(path.join(root, "workspace", ".pi", "SYSTEM.example.md"), "utf8");
+  assert.match(system, /telegram_send 发到用户的 Telegram 私聊/);
+  assert.match(system, /原先什么样、这次改了什么、做完没有、哪些验证过、哪些没验证成、还要不要用户动手/);
+  assert.match(system, /主服务不会替你入队或转发/);
+  assert.match(system, /直说没做完、卡在哪、出了什么错/);
+  assert.match(system, /已经做完的不要说成没做完/);
+  assert.match(system, /不要贴 CA 原报告或终端输出/);
+  assert.doesNotMatch(system, /戳一戳/);
+  assert.match(system, /没有从验收文件或工具结果里读到的内容，不要说成事实/);
+  assert.match(system, /不要只喊「我说错了」/);
+  pass("系统提示词要求模型自己把终态通知发到 Telegram 私聊，没读到不能当事实");
 
   const handlerJs = stripTypeScriptTypes(sliceDeclaration(source, "async function handleDelegationEvent("), { mode: "transform" });
+  const retellJs = stripTypeScriptTypes(sliceDeclaration(source, "async function retellForUser("), { mode: "transform" });
   const buildHandler = (deps) => new Function(
     "broadcastJobs", "notifications", "store", "server", "deliveryPipeline", "delegations",
-    "reviewDelegation", "unsettledNotice", "failureNotice", "cleanupHoldNotice", "finalizeUserNotice", "redactSensitive",
+    "reviewDelegation", "retellForUser", "attentionNotice", "redactSensitive",
+    "log", "retellFallbackRecord", "telegramPrivateChatId", "telegramAllowFrom",
     `${handlerJs}\nreturn handleDelegationEvent;`,
   )(
     deps.broadcastJobs, deps.notifications, deps.store, deps.server, deps.deliveryPipeline, deps.delegations,
-    deps.reviewDelegation, deps.unsettledNotice, deps.failureNotice, deps.cleanupHoldNotice, deps.finalizeUserNotice, deps.redactSensitive,
+    deps.reviewDelegation, deps.retellForUser, deps.attentionNotice, deps.redactSensitive,
+    deps.log, deps.retellFallbackRecord, deps.telegramPrivateChatId, deps.telegramAllowFrom,
+  );
+  const buildRetell = (deps) => new Function(
+    "runner", "currentModelSpec", "reviewTimeoutMs", "userId", "retellPrompt",
+    "log", "retellFallbackRecord", "userCopyRejectDetail",
+    `${retellJs}\nreturn retellForUser;`,
+  )(
+    deps.runner, deps.currentModelSpec, deps.reviewTimeoutMs, deps.userId, deps.retellPrompt,
+    deps.log, deps.retellFallbackRecord, deps.userCopyRejectDetail,
   );
 
   function harness(over = {}) {
     const order = [];
     const notes = new Map();
     const chats = [];
+    const seen = [];
+    const logs = [];
     const deps = {
       broadcastJobs: () => order.push("broadcastJobs"),
       notifications: {
@@ -166,90 +233,316 @@ try {
         appendOnce: (message) => { order.push(`append:${message.text}`); chats.push(message); return { message, inserted: true }; },
       },
       server: { broadcast: () => order.push("broadcast") },
-      deliveryPipeline: { run: async () => ({ text: delivered, delivered: true, holdProject: false }) },
+      deliveryPipeline: {
+        run: async () => ({
+          text: `交付原文 ${MARKER} ${SNAP}`,
+          delivered: true,
+          holdProject: false,
+          record: { targetReview: { verdict: "passed", summary: "登录失败时会说明原因" }, executionReview: { verdict: "passed", summary: `${MARKER} npx tsc` } },
+        }),
+      },
       delegations: { setDeliveryHold: () => order.push("hold") },
-      reviewDelegation: async () => ({ verdict: "passed", summary: "登录失败时会说明原因", text: passed }),
-      unsettledNotice,
-      failureNotice,
-      cleanupHoldNotice,
-      finalizeUserNotice,
-      redactSensitive: (text) => text,
+      reviewDelegation: async () => {
+        order.push("review");
+        return { verdict: "passed", summary: "登录失败时会说明原因", text: `不要采用 ${MARKER}`, stage: undefined };
+      },
+      retellForUser: async (input) => {
+        seen.push(input);
+        order.push("retell");
+      },
+      attentionNotice,
+      redactSensitive: (value) => value,
+      log: (message) => logs.push(String(message)),
+      retellFallbackRecord,
+      telegramPrivateChatId,
+      telegramAllowFrom: ["100000002"],
       ...over,
     };
-    return { notes, chats, order, handler: buildHandler(deps) };
+    return { notes, chats, order, seen, logs, handler: buildHandler(deps) };
   }
 
   const job = {
-    id: "ca-x", status: "completed", deliveryManaged: false, source: { channel: "telegram", chatId: "-100", threadId: 1 },
-    message: "完成 npx tsc /memory/worktrees/ca-x", task: "task", lastOutput: "",
+    id: "ca-x", status: "completed", deliveryManaged: false,
+    source: { channel: "telegram", chatId: "-100", threadId: 1 },
+    message: `完成 ${MARKER}`, task: "把登录失败的提示改清楚",
+    lastOutput: SNAP, report: report,
   };
+
+  function unsent(run, id = "job:ca-x:terminal:terminal") {
+    assert.equal(run.notes.get(id), undefined);
+    assert.deepEqual(run.chats, []);
+    assert.ok(!run.order.some((item) => item.startsWith("put:") || item.startsWith("append:")));
+    assert.doesNotMatch(JSON.stringify(run.chats), /事情已经收尾|通知没写出来|没做完/);
+  }
+
   const completed = harness();
   await completed.handler(job, "terminal");
-  const notification = completed.notes.get("job:ca-x:terminal:terminal");
-  assert.equal(notification.text, passed);
-  assert.equal(notification.kind, "job");
-  assert.deepEqual(completed.chats.map((item) => item.text), [passed]);
-  assert.equal(completed.order.filter((item) => item.startsWith("put:")).length, 1);
-  assert(completed.order.findIndex((item) => item.startsWith("put:")) < completed.order.findIndex((item) => item.startsWith("append:")));
-  assertNotice(notification.text, "聊天通知");
-  pass("落库：对话文本就是五件事，不经过第二次改写");
+  unsent(completed);
+  assert.equal(completed.seen.length, 1);
+  assert.equal(completed.seen[0].report, report);
+  assert.equal(completed.seen[0].chatId, "100000002");
+  assert.notEqual(completed.seen[0].chatId, "-100");
+  assert.match(retellPrompt(completed.seen[0]), new RegExp(MARKER));
+  assert.match(retellPrompt(completed.seen[0]), /telegram_send/);
+  assert.doesNotMatch(retellPrompt(completed.seen[0]), /终端快照甲|戳一戳/);
+  assert.equal(completed.order.filter((item) => item === "review").length, 1);
+  assert.deepEqual(completed.logs, []);
+  pass("终态只把交付交给模型去发 Telegram 私聊，主程序不入队");
 
   const deliveredRun = harness();
   await deliveredRun.handler({ ...job, deliveryManaged: true, deliveryAttempt: 2 }, "terminal");
-  const deliveredNote = deliveredRun.notes.get("job:ca-x:terminal:terminal:delivery-2");
-  assert.equal(deliveredNote.text, delivered);
+  unsent(deliveredRun, "job:ca-x:terminal:terminal:delivery-2");
+  assert.equal(deliveredRun.seen[0].acceptance.verdict, "passed");
+  assert.equal(deliveredRun.seen[0].chatId, "100000002");
+  assert.equal(deliveredRun.seen[0].report, report);
   assert(deliveredRun.order.includes("hold"));
-  pass("交付分支：去重 id 带 :delivery-N，聊天用交付五件事");
+  assert(!deliveredRun.order.includes("review"));
+  pass("交付分支仍把验收结论交给模型，主程序不代发");
 
   const leaked = harness({
-    deliveryPipeline: { run: async () => ({ text: "交付原文：diff --git a/x b/x 工作树 /memory/worktrees/ca-x", delivered: false, holdProject: true }) },
+    deliveryPipeline: { run: async () => ({ text: `交付原文 ${MARKER} ${SNAP}`, delivered: false, holdProject: true }) },
   });
   await leaked.handler({ ...job, deliveryManaged: true, deliveryAttempt: 0 }, "terminal");
-  const leakedNote = leaked.notes.get("job:ca-x:terminal:terminal:delivery-0");
-  assertNotice(leakedNote.text, "脏交付文案");
-  assert.doesNotMatch(leakedNote.text, /diff|worktree|git/);
-  pass("交付原文若夹路径，聊天仍回落到五件事");
+  unsent(leaked, "job:ca-x:terminal:terminal:delivery-0");
+  assert.equal(leaked.seen[0].acceptance, undefined);
+  assert.doesNotMatch(JSON.stringify(leaked.seen[0]), /终端快照甲/);
+  assert.match(retellPrompt(leaked.seen[0]), new RegExp(MARKER));
+  pass("交付管道上的原文不会变成聊天内容");
+
+  const interrupted = harness({
+    deliveryPipeline: { run: async () => ({
+      text: `原先改动只在副本里 ${MARKER}`,
+      delivered: false,
+      holdProject: true,
+      interrupted: true,
+      interruptError: `${SNAP} ${MARKER}`,
+      record: { targetReview: { verdict: "passed", summary: "登录失败时会说明原因" } },
+    }) },
+  });
+  await interrupted.handler({ ...job, deliveryManaged: true, deliveryAttempt: 1 }, "terminal");
+  assert.equal(interrupted.seen[0].acceptance.verdict, "unverified");
+  unsent(interrupted, "job:ca-x:terminal:terminal:delivery-1");
+  assert.match(interrupted.seen[0].note, /收尾还没确认/);
+  pass("交付中断时按没核过交给模型，主程序不把中断说成已经落稳");
 
   const failedRun = harness();
-  await failedRun.handler({ ...job, status: "timed_out", message: "超过 60 分钟 npx tsc", cleanupError: "pane 未关闭 /memory/worktrees/ca-x" }, "terminal");
-  const failedNote = failedRun.notes.get("job:ca-x:terminal:terminal");
-  assertNotice(failedNote.text, "收尾未确认");
-  assert.match(failedNote.text, /收尾尚未确认/);
-  assert.doesNotMatch(failedNote.text, /tsc|pane|worktree|60/);
-  pass("失败分支：收尾报错不进聊天，只留五件事");
+  await failedRun.handler({
+    ...job, status: "completed", cleanupError: `pane 未关闭 ${SNAP} ${MARKER}`,
+  }, "terminal");
+  assert.equal(failedRun.order.filter((item) => item === "review").length, 1);
+  assert.equal(failedRun.seen[0].acceptance.verdict, "unverified");
+  unsent(failedRun);
+  assert.doesNotMatch(JSON.stringify(failedRun.chats), new RegExp(`${MARKER}|终端快照|pane`));
+  pass("收尾未确认时仍先验收，主程序不把报错发给用户");
 
-  const attention = harness({ finalizeUserNotice: () => { throw new Error("attention 不允许改写"); } });
+  const timedOut = harness();
+  await timedOut.handler({ ...job, status: "timed_out", message: MARKER, cleanupError: undefined }, "terminal");
+  assert.equal(timedOut.order.filter((item) => item === "review").length, 0);
+  assert.match(timedOut.seen[0].note, /直说没做完/);
+  assert.match(timedOut.seen[0].note, /timed_out/);
+  assert.match(timedOut.seen[0].note, new RegExp(MARKER));
+  assert.match(retellPrompt(timedOut.seen[0]), /直说没做完/);
+  assert.doesNotMatch(retellPrompt(timedOut.seen[0]), /不要把已经做完的事说成没做完/);
+  unsent(timedOut);
+  assert.doesNotMatch(JSON.stringify(timedOut.chats), /终端快照甲/);
+  pass("超时走模型发送通道，并要求直说没做完和卡住原因，主程序不代发");
+
+  const broke = harness();
+  await broke.handler({ ...job, status: "failed", message: `编译中断 ${MARKER}`, cleanupError: undefined }, "terminal");
+  assert.equal(broke.order.filter((item) => item === "review").length, 0);
+  assert.equal(broke.seen[0].status, "failed");
+  assert.match(broke.seen[0].note, /直说没做完/);
+  assert.match(broke.seen[0].note, new RegExp(`编译中断 ${MARKER}`));
+  assert.match(retellPrompt(broke.seen[0]), /直说没做完/);
+  unsent(broke);
+  pass("执行失败走同一条模型发送通道，主程序不代发");
+
+  const attention = harness({ retellForUser: async () => { throw new Error("attention 不转述"); } });
   await attention.handler({ ...job, attentionSequence: 7, message: "15 分钟无进展" }, "attention");
-  const attentionNote = attention.notes.get("job:ca-x:attention:7");
-  assert.equal(attentionNote.kind, "attention");
-  assert.equal(attentionNote.text, "后台任务 ca-x 需要关注：15 分钟无进展。\n任务未因 PA 对话结束而停止，整体执行时限仍有效；你可以继续聊天或取消该任务。");
-  pass("attention 事件：保持原有文案，不套五件事");
+  assert.equal(attention.notes.get("job:ca-x:attention:7").text, "后台任务 ca-x 需要关注：15 分钟无进展。\n任务未因 PA 对话结束而停止，整体执行时限仍有效；你可以继续聊天或取消该任务。");
+  pass("attention 不走转述");
 
-  const repeated = harness();
-  repeated.notes.set("job:ca-x:terminal:terminal", { id: "job:ca-x:terminal:terminal", text: "已存在的短汇报", kind: "job", source: job.source });
+  const dumped = harness();
+  await dumped.handler({ ...job, attentionSequence: 8, message: `${MARKER} ${SNAP}` }, "attention");
+  assert.doesNotMatch(dumped.notes.get("job:ca-x:attention:8").text, new RegExp(`${MARKER}|终端快照`));
+  pass("attention 遇到原始输出时改回短提示");
+
+  const repeated = harness({ retellForUser: async () => { throw new Error("不应重写"); } });
+  repeated.notes.set("job:ca-x:terminal:terminal", { id: "job:ca-x:terminal:terminal", text: "已存在的转述", kind: "job", source: job.source });
   await repeated.handler(job, "terminal");
-  assert.equal(repeated.chats[0].text, "已存在的短汇报");
+  assert.equal(repeated.chats[0].text, "已存在的转述");
   assert(!repeated.order.some((item) => item.startsWith("put:")));
-  pass("幂等：同一事件已有通知时不重写");
+  pass("同一事件已有通知时不重写");
 
   const qq = harness();
   await qq.handler({ ...job, source: { channel: "qq", target: "private:12345" } }, "terminal");
-  assert.equal(qq.notes.get("job:ca-x:terminal:terminal").text, passed);
-  pass("QQ 分支：仍按 3000 字截断入口，短通知原样入库");
+  unsent(qq);
+  assert.equal(qq.seen[0].chatId, "100000002");
+  pass("QQ 来源的终态也只准备发到 Telegram 私聊，主程序不代发");
+
+  const fallbackRun = harness({ retellForUser: async () => { throw new Error(`model down ${MARKER}`); } });
+  await fallbackRun.handler(job, "terminal");
+  unsent(fallbackRun);
+  assert.match(fallbackRun.logs.join("\n"), new RegExp(`reason=exception job=ca-x detail=model down ${MARKER}`));
+  assert.match(fallbackRun.logs.join("\n"), /draft=\(空\)/);
+  assert.doesNotMatch(fallbackRun.logs.join("\n"), /事情已经收尾|通知没写出来|没做完/);
+  pass("转述调用抛错时不给用户发占位句，日志记下异常");
+
+  const calls = [];
+  const retellLogs = [];
+  function retellWith(run, logs, timeoutMs = 180000) {
+    return buildRetell({
+      runner: { run },
+      currentModelSpec: () => "test-model",
+      reviewTimeoutMs: timeoutMs,
+      userId: "me",
+      retellPrompt,
+      log: (line) => logs.push(String(line)),
+      retellFallbackRecord,
+      userCopyRejectDetail,
+    });
+  }
+  function toolRound(text, endDetail, result) {
+    return async (body, options) => {
+      calls.push({ body, options });
+      options.onEvent?.({ kind: "tool_start", id: "1", name: "telegram_send", detail: text });
+      options.onEvent?.({ kind: "tool_end", id: "1", name: "telegram_send", isError: false, detail: endDetail });
+      return result;
+    };
+  }
+  const input = { task: "把登录失败的提示改清楚", status: "completed", report, acceptance: { verdict: "passed", summary: "登录失败时会说明原因" }, jobId: "ca-x", chatId: "100000002" };
+  const retell = retellWith(toolRound(withNames, "已发到 Telegram 私聊", { ok: true, text: "已发" }), retellLogs);
+  assert.equal(await retell(input, [JSON.stringify(report), SNAP]), undefined);
+  assert.deepEqual(retellLogs, []);
+  assert.match(calls[0].body, new RegExp(MARKER));
+  assert.match(calls[0].body, /telegram_send/);
+  assert.match(calls[0].body, /原先是什么样/);
+  assert.doesNotMatch(calls[0].body, /终端快照甲|戳一戳/);
+  assert.equal(calls[0].options.noTools, undefined);
+  assert.equal(calls[0].options.tools, undefined);
+  assert.equal(calls[0].options.model, "test-model");
+  assert.equal(calls[0].options.userId, "me");
+  assert.equal(calls[0].options.env.PI_TELEGRAM_CHAT_ID, "100000002");
+  assert.equal(calls[0].options.env.PI_REVIEW_JOB_ID, "ca-x");
+  const missingChatLogs = [];
+  const missingChat = retellWith(async () => { throw new Error("不应调用模型"); }, missingChatLogs);
+  await missingChat({ ...input, chatId: "" }, []);
+  assert.match(missingChatLogs.join("\n"), /reason=call-failure job=ca-x detail=no-private-chat/);
+  const downLogs = [];
+  const down = retellWith(async () => { throw new Error(`down ${MARKER} ${SNAP}`); }, downLogs);
+  await down(input, [SNAP]);
+  assert.match(downLogs.join("\n"), /reason=exception job=ca-x/);
+  assert.match(downLogs.join("\n"), new RegExp(`detail=down ${MARKER}`));
+  const rejectedLogs = [];
+  const rejected = retellWith(async () => ({ ok: false, text: `${MARKER} ${SNAP}`, error: `unavailable ${MARKER}` }), rejectedLogs, 1000);
+  await rejected(input, [SNAP]);
+  assert.match(rejectedLogs.join("\n"), /reason=call-failure job=ca-x/);
+  assert.match(rejectedLogs.join("\n"), new RegExp(`detail=unavailable ${MARKER}`));
+  assert.match(rejectedLogs.join("\n"), new RegExp(`draft=${MARKER}`));
+  const filteredLogs = [];
+  const filtered = retellWith(toolRound("Cursor PR16 is merged.", "未发送 detail=no-han", { ok: true, text: "" }), filteredLogs);
+  await filtered(input, []);
+  assert.match(filteredLogs.join("\n"), /reason=filter-rejection job=ca-x detail=no-han draft=Cursor PR16 is merged\./);
+  const failedQualifiedLogs = [];
+  const failedQualified = retellWith(toolRound(withPath, "未发送 detail=send-failed", { ok: true, text: "" }), failedQualifiedLogs);
+  await failedQualified(input, []);
+  assert.match(failedQualifiedLogs.join("\n"), /reason=call-failure job=ca-x detail=send-failed/);
+  assert.match(failedQualifiedLogs.join("\n"), /draft=改动在 src\/login\.ts/);
+  assert.doesNotMatch([downLogs, rejectedLogs, filteredLogs, failedQualifiedLogs].flat().join("\n"), /没做完|事情已经收尾|通知没写出来/);
+  const placeholderLogs = [];
+  const placeholderRetell = retellWith(toolRound(PLACEHOLDER, "未发送 detail=placeholder", { ok: true, text: "" }), placeholderLogs);
+  await placeholderRetell(input, []);
+  assert.match(placeholderLogs.join("\n"), /reason=filter-rejection job=ca-x detail=placeholder draft=事情已经收尾/);
+  pass("模型自己发送；失败时用户收不到占位句，并按调用失败、过滤或异常记下草稿");
+
+  const composedLogs = [];
+  const composed = harness({
+    retellForUser: retellWith(toolRound("Cursor only", "未发送 detail=no-han", { ok: true, text: "Cursor only" }), composedLogs),
+  });
+  await composed.handler(job, "terminal");
+  unsent(composed);
+  assert.equal(composedLogs.length, 1);
+  assert.match(composedLogs[0], /reason=filter-rejection job=ca-x detail=no-han draft=Cursor only/);
+  assert.deepEqual(composed.logs, []);
+  const composedOkLogs = [];
+  const composedOk = harness({
+    retellForUser: retellWith(toolRound(withNames, "已发到 Telegram 私聊", { ok: true, text: "已发" }), composedOkLogs),
+  });
+  await composedOk.handler(job, "terminal");
+  unsent(composedOk);
+  assert.deepEqual(composedOkLogs, []);
+  assert.deepEqual(composedOk.logs, []);
+  const composedDownLogs = [];
+  const composedDown = harness({
+    retellForUser: retellWith(async () => { throw new Error(`boom ${MARKER}`); }, composedDownLogs),
+  });
+  await composedDown.handler(job, "terminal");
+  unsent(composedDown);
+  assert.equal(composedDownLogs.length, 1);
+  assert.match(composedDownLogs[0], new RegExp(`reason=exception job=ca-x detail=boom ${MARKER}`));
+  assert.deepEqual(composedDown.logs, []);
+  pass("模型发出合格中文后主程序不再转发；失败只记在转述日志里");
 
   const handlerSource = sliceDeclaration(source, "async function handleDelegationEvent(");
-  assert.doesNotMatch(source, /summarizeForUser|rewriteReportWithModel|userReportMaxChars/);
-  assert.match(handlerSource, /finalizeUserNotice\(text\)/);
+  const retellSource = sliceDeclaration(source, "async function retellForUser(");
+  const reviewSource = sliceDeclaration(source, "async function evaluateDelegation(");
+  assert.match(handlerSource, /chatId: telegramPrivateChatId\(telegramAllowFrom, job\.source\)/);
+  assert.match(handlerSource, /终态通知由模型用 telegram_send 自己发，主程序不入队/);
+  assert.match(handlerSource, /这次没有做完。请直说没做完。状态：\$\{job\.status\}/);
+  assert.match(handlerSource, /reason: "exception"/);
+  assert.doesNotMatch(handlerSource, /reason: "filter-rejection"|acceptUserCopy\(spoken/);
+  assert.match(retellSource, /reason: "call-failure"/);
+  assert.match(retellSource, /reason: "filter-rejection"/);
+  assert.match(retellSource, /reason: "exception"/);
+  assert.match(retellSource, /retellFallbackRecord/);
+  assert.match(retellSource, /runner\.run\(/);
+  assert.match(retellSource, /PI_TELEGRAM_CHAT_ID/);
+  assert.match(retellSource, /name === "telegram_send"/);
+  assert.doesNotMatch(retellSource, /noTools|reviewRunner|notifications\.put/);
+  assert.match(handlerSource, /reviewDelegation\(job\)/);
+  assert.match(handlerSource, /deliveryPipeline\.run\(job\)/);
+  assert.match(handlerSource, /const guard = \[JSON\.stringify\(job\.report \?\? ""\), job\.lastOutput\];/);
+  assert.match(handlerSource, /attentionNotice\(job\.id, job\.message\)/);
   assert.match(handlerSource, /text: job\.source\.channel === "qq" \? text\.slice\(0, 3000\) : text/);
-  assert.match(handlerSource, /const id = `job:\$\{job\.id\}:\$\{event\}:\$\{stamp\}\$\{event === "terminal" && job\.deliveryManaged \? `:delivery-\$\{job\.deliveryAttempt \?\? 0\}` : ""\}`;/);
+  assert.doesNotMatch(handlerSource, /speakFromFacts|noticePrompt|factsFromReview|factsFromDelivery|outcome\.text|renderFiveNotice/);
+  assert.match(retellSource, /retellPrompt\(input\)/);
+  assert.doesNotMatch(retellSource, /NOTICE_FALLBACK|事情已经收尾|通知没写出来/);
+  assert.doesNotMatch(handlerSource, /NOTICE_FALLBACK|事情已经收尾|通知没写出来/);
+  assert.doesNotMatch(source, /事情已经收尾，通知没写出来/);
+  assert.doesNotMatch(retellSource, /lastOutput|终端快照|speakFromFacts|noticePrompt/);
+  const extension = readFileSync(path.join(root, "workspace", ".pi", "extensions", "telegram-send.ts"), "utf8");
+  assert.match(extension, /noticeSendDecision/);
+  assert.match(extension, /PI_TELEGRAM_CHAT_ID/);
+  assert.match(extension, /已发到 Telegram 私聊/);
+  assert.match(extension, /sendMessage/);
+  assert.doesNotMatch(extension, /notifications\.put/);
+  assert.match(extension, /任务确实没做完时直说没做完/);
+  assert.match(extension, /已经做完的不要说成没做完/);
+  const requestSource = sliceDeclaration(source, "async function handleRequest(");
+  const settleSource = sliceDeclaration(source, "async function settleRequest(");
+  const turnSource = sliceDeclaration(source, "async function notifyUnfinishedTurn(");
+  assert.match(requestSource, /notifyUnfinishedTurn\(request, \/超时\/\.test\(message\) \? "timed_out" : "failed"/);
+  assert.match(requestSource, /notifyUnfinishedTurn\(request, "failed", message\)/);
+  assert.match(requestSource, /modelNotice: true/);
+  assert.doesNotMatch(requestSource, /本轮处理失败|不受本轮超时影响/);
+  assert.match(turnSource, /retellForUser\(\{/);
+  assert.match(turnSource, /这次没有做完。请直说没做完/);
+  assert.match(settleSource, /modelNotice === true/);
+  assert.ok(settleSource.indexOf("modelNotice") < settleSource.indexOf("notifications.put"));
+  assert.match(source, /if \(result\.meta\?\.modelNotice === true\) return "";/);
+  assert.match(reviewSource, /CA 报告（待核实）/);
+  assert.match(reviewSource, /终端快照（待核实）/);
+  assert.match(reviewSource, /tools: \["read", "bash"\]/);
+  assert.match(reviewSource, /checks: checks\.map/);
+  assert.match(reviewSource, /rawReply:/);
   assert.match(source, /\.slice\(0, 6000\)/);
   assert.match(source, /memory", "delegation-reviews"/);
-  assert.match(source, /checks: checks\.map/);
-  assert.match(source, /detail,/);
-  assert.match(source, /rawReply:/);
-  assert.match(source, /review\.detail/);
-  assert.match(source, /tools: \["read", "bash"\]/);
-  pass("源码约束：验收仍独立跑并落盘明细；聊天只渲染五字段");
+  assert.doesNotMatch(reviewSource, /retellPrompt|retellForUser/);
+  assert.doesNotMatch(source, /speakFromFacts|noticePrompt|factsFromReview/);
+  const telegram = readFileSync(path.join(root, "app", "telegram-client.mjs"), "utf8");
+  assert.match(telegram, /splitTelegramText\(notification\.text\)/);
+  assert.match(source, /text: notification\.text/);
+  pass("验收仍独立运行并落盘；终态由模型发到 Telegram 私聊，主程序不代发");
 
   console.log(`\nPASS ${checks} report-summary checks；未启动服务、未调用模型、未写入 memory/`);
 } catch (error) {
