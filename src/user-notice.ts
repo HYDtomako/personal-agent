@@ -19,7 +19,7 @@ export interface RetellInput {
 
 /** 只接受用户自己的私聊 id。群（负数）和白名单外的 id 都不用。 */
 export function telegramPrivateChatId(
-  allowFrom: readonly Array<string | number> = [],
+  allowFrom: readonly (string | number)[] = [],
   source?: { channel?: string; chatId?: string },
 ): string {
   const ids = allowFrom.map((id) => String(id).trim()).filter((id) => /^[1-9]\d*$/.test(id));
